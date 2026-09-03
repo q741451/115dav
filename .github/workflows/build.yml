@@ -120,16 +120,32 @@ jobs:
 
   verify:
     # The point of pinning the builder is that the host cannot influence the
-    # output. This job is the test of that claim: build again on a different
-    # runner image and require byte-identical binaries. If GitHub ever ships a
-    # host change that leaks into the build, this goes red instead of the
-    # release silently shipping something else.
+    # output. This job tests that claim instead of assuming it: build again
+    # elsewhere and require byte-identical binaries.
+    #
+    # Note which way round the pinning goes. `build` runs on a pinned label
+    # because it produces what ships. This job is the canary, so it wants
+    # exposure to whatever GitHub is actually running:
+    #
+    #   ubuntu-22.04   a materially different image from the 24.04 above, so
+    #                  the comparison means something today rather than
+    #                  quietly comparing an image against itself
+    #   ubuntu-latest  deliberately unpinned -- the day GitHub moves it (26.04
+    #                  is already in preview) this leg tries the new image
+    #                  before a release ever has to
+    #
+    # If a label is retired the leg fails loudly, which is the right outcome:
+    # a one-line edit, not a silently weakened check.
     needs: build
-    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-22.04, ubuntu-latest]
+    runs-on: ${{ matrix.host }}
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rebuild on a different host image
+      - name: Rebuild on ${{ matrix.host }}
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: scripts/in-builder.sh scripts/build-all.sh
@@ -143,9 +159,9 @@ jobs:
           set -euo pipefail
           printf '%s\n' "$EXPECTED" > /tmp/expected.sums
           if diff -u /tmp/expected.sums dist/SHA256SUMS.bin; then
-            echo "identical on ubuntu-24.04 and ubuntu-22.04 — the build is hermetic"
+            echo "${{ matrix.host }} reproduced the ubuntu-24.04 build exactly"
           else
-            echo "::error::the host image changed the output; the build is not hermetic"
+            echo "::error::${{ matrix.host }} produced different binaries; the build is not hermetic"
             exit 1
           fi
 

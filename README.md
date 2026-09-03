@@ -93,9 +93,9 @@ VERSION=v0.1.0 scripts/build-all.sh      # 产物在 dist/
 
 产物只应该取决于源码、依赖和工具链，不该取决于哪台机器编的。所以：
 
-- **编译器只在 digest 钉死的容器里跑**（`golang:1.27.1-bookworm@sha256:648f44…`）。钉 digest 不钉 tag —— tag 能被发布者重新指向，digest 就是内容本身。宿主 runner 只负责起进程，它的 OS 怎么更新都碰不到产物。
+- **编译器只在 digest 钉死的容器里跑**（`golang:1.27.1-bookworm@sha256:648f44…`）。钉 digest 不钉 tag —— tag 能被发布者重新指向，digest 就是内容本身。
 - **`GOTOOLCHAIN=local`**。这条最容易漏：否则 `go.mod` 里的 go 指令会让 Go 自己下载另一个版本的工具链，容器白钉了。
-- **`CGO_ENABLED=0` + 全部交叉编译**。不link系统 libc，不用 macOS/Windows runner，少两套会漂移的环境。
+- **`CGO_ENABLED=0` + 全部交叉编译**。不链接系统 libc，不用 macOS/Windows runner，少两套会漂移的环境。
 - **依赖由 `go.sum` 按哈希锁定**，CI 里跑 `go mod verify`。
 
 升级 Go 只需要改 workflow 里 `BUILDER:` 那一行。新 digest 这样取：
@@ -104,9 +104,29 @@ VERSION=v0.1.0 scripts/build-all.sh      # 产物在 dist/
 docker buildx imagetools inspect golang:1.28.0-bookworm | head -2
 ```
 
+### 系统钉在哪一层
+
+两个「系统」，别混：
+
+| | 是什么 | 钉法 |
+| --- | --- | --- |
+| 容器里 | Debian 12 bookworm，**编译器实际运行的系统** | digest 钉死，连每个 apt 包都是那一份字节 |
+| 宿主 runner | GitHub 的 ubuntu-24.04，只负责起进程 | 钉了标签，但**它本来就影响不到产物** |
+
+`CGO_ENABLED=0` 之下，宿主的 libc、头文件、链接器一概不参与编译，所以宿主是 22 还是 24 对二进制没有任何影响 —— 把宿主钉到更老的版本换不来确定性，只会让 workflow 更早撞上标签退役。
+
+唯一会让容器的 Debian 版本变得要紧的情况是**开启 cgo**：那时候 glibc 的符号版本会被写进二进制，用新系统编出来的东西在老系统上跑不起来，这才是「故意钉一个老基础镜像」有意义的场景。本项目没有 cgo，所以不需要。
+
 ### 不是假设，是验证
 
-`verify` job 会在**另一个** runner 镜像（ubuntu-22.04，主构建是 24.04）上用同一个容器重新编一遍，比对二进制的 SHA256。对得上才算数。哪天 GitHub 换镜像真的把构建弄脏了，这个 job 会直接红掉，而不是让 Release 悄悄发出一个不一样的东西。
+`verify` job 用同一个容器重新编一遍，比对二进制的 SHA256，对得上才算数。
+
+注意钉法是**反过来的**：`build` 跑在钉死的 `ubuntu-24.04` 上，因为它出的是要发布的东西；`verify` 是探针，所以要故意去接触 GitHub 真正在跑的镜像：
+
+- `ubuntu-22.04` —— 今天就跟 24.04 是实打实两个镜像，比对不会退化成自己跟自己比
+- `ubuntu-latest` —— 故意不钉。GitHub 哪天把它挪到 26.04（已在公开预览），这条腿当天就先替 Release 踩一遍
+
+标签哪天退役，对应那条腿会直接失败 —— 这正是想要的结果：改一行，而不是悄无声息地少了一道检查。
 
 构建本身是可复现的（`-trimpath` / `-buildvcs=false` / `-buildid=` / 归档时间戳归一），同一个 commit 编两次，二进制和归档都逐字节相同。
 
