@@ -1,0 +1,300 @@
+package dav
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"net"
+	"net/http"
+	"path"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"golang.org/x/sync/singleflight"
+
+	"github.com/q741451/115dav/internal/pan115"
+)
+
+// linkCache remembers resolved CDN targets. 115 hands out short-lived URLs, so
+// the TTL is only an optimisation: expiry is ultimately detected by the CDN
+// refusing a request, which invalidates the entry and forces a fresh resolve.
+type linkCache struct {
+	backend Backend
+	ttl     time.Duration
+
+	group singleflight.Group
+	mu    sync.Mutex
+	items map[string]cachedLink
+}
+
+type cachedLink struct {
+	target  *pan115.Target
+	expires time.Time
+}
+
+func newLinkCache(backend Backend, ttl time.Duration) *linkCache {
+	return &linkCache{backend: backend, ttl: ttl, items: map[string]cachedLink{}}
+}
+
+func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, error) {
+	if target := c.lookup(pickCode); target != nil {
+		return target, nil
+	}
+	// Scrubbing a video fires many range requests at once; without this they
+	// would each resolve the same pick code separately.
+	resolved, err, _ := c.group.Do(pickCode, func() (any, error) {
+		if target := c.lookup(pickCode); target != nil {
+			return target, nil
+		}
+		target, err := c.backend.Resolve(ctx, pickCode)
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.items[pickCode] = cachedLink{target: target, expires: time.Now().Add(c.ttl)}
+		c.mu.Unlock()
+		return target, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resolved.(*pan115.Target), nil
+}
+
+func (c *linkCache) lookup(pickCode string) *pan115.Target {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if item, ok := c.items[pickCode]; ok && time.Now().Before(item.expires) {
+		return item.target
+	}
+	return nil
+}
+
+func (c *linkCache) forget(pickCode string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.items, pickCode)
+}
+
+// streamer proxies file bytes from the 115 CDN to the WebDAV client.
+//
+// Proxying rather than redirecting is deliberate: a CDN URL is tied to the
+// User-Agent and session that requested it, which a player would not reproduce
+// if it were sent there directly.
+type streamer struct {
+	links  *linkCache
+	client *http.Client
+	log    *slog.Logger
+	bufs   sync.Pool
+}
+
+// streamBufferSize trades memory for syscalls on large sequential reads.
+const streamBufferSize = 256 << 10
+
+func newStreamer(backend Backend, linkTTL time.Duration, log *slog.Logger) *streamer {
+	return &streamer{
+		links: newLinkCache(backend, linkTTL),
+		// No Client.Timeout: a feature-length file legitimately streams for
+		// hours. The transport bounds the parts that should be quick.
+		//
+		// Redirects use the standard policy, which keeps the User-Agent and
+		// carries cookies only to the same registered domain.
+		client: &http.Client{
+			Transport: &http.Transport{
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 30 * time.Second,
+				IdleConnTimeout:       90 * time.Second,
+				MaxIdleConnsPerHost:   8,
+				ForceAttemptHTTP2:     true,
+			},
+		},
+		log:  log,
+		bufs: sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
+	}
+}
+
+// serveHead answers from directory metadata alone. Players probe with HEAD
+// before opening a stream, and there is no reason to spend a resolve on it.
+func (s *streamer) serveHead(w http.ResponseWriter, entry pan115.Entry) {
+	header := w.Header()
+	header.Set("Accept-Ranges", "bytes")
+	header.Set("Content-Length", strconv.FormatInt(entry.Size, 10))
+	header.Set("Content-Type", contentType(entry.Name))
+	if !entry.ModTime.IsZero() {
+		header.Set("Last-Modified", entry.ModTime.UTC().Format(http.TimeFormat))
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// serveGet streams the file, forwarding the client's range request upstream.
+func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115.Entry) {
+	resp, err := s.open(r, entry)
+	if err != nil {
+		s.fail(w, r, entry, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	copyResponseHeaders(w.Header(), resp.Header, entry)
+	w.WriteHeader(resp.StatusCode)
+
+	buf := s.bufs.Get().(*[]byte)
+	defer s.bufs.Put(buf)
+	if _, err := io.CopyBuffer(w, resp.Body, *buf); err != nil && !isClientGone(err) {
+		// The status line is already out; all that is left is to record it.
+		s.log.Warn("stream interrupted", "file", entry.Name, "err", err)
+	}
+}
+
+// open resolves the file and performs the upstream request, retrying once with
+// a freshly resolved URL if the CDN rejects the cached one.
+func (s *streamer) open(r *http.Request, entry pan115.Entry) (*http.Response, error) {
+	var lastErr error
+	for attempt := range 2 {
+		target, err := s.links.get(r.Context(), entry.PickCode)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := s.fetch(r, target)
+		if err != nil {
+			return nil, err
+		}
+		if !isExpired(resp.StatusCode) {
+			return resp, nil
+		}
+
+		resp.Body.Close()
+		lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name}
+		s.links.forget(entry.PickCode)
+		if attempt == 0 {
+			s.log.Debug("download link rejected, resolving again",
+				"file", entry.Name, "status", resp.StatusCode)
+		}
+	}
+	return nil, lastErr
+}
+
+func (s *streamer) fetch(r *http.Request, target *pan115.Target) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = target.Header.Clone()
+	// Seeking is the whole point: hand the range straight through and let the
+	// CDN answer it, rather than reconstructing it locally.
+	for _, name := range []string{"Range", "If-Range"} {
+		if value := r.Header.Get(name); value != "" {
+			req.Header.Set(name, value)
+		}
+	}
+	return s.client.Do(req)
+}
+
+func (s *streamer) fail(w http.ResponseWriter, r *http.Request, entry pan115.Entry, err error) {
+	if isClientGone(err) || r.Context().Err() != nil {
+		return
+	}
+	s.log.Error("cannot stream file", "file", entry.Name, "err", err)
+
+	status := http.StatusBadGateway
+	var notDownloadable *pan115.ErrNotDownloadable
+	switch {
+	case errors.As(err, &notDownloadable):
+		status = http.StatusForbidden
+	case errors.Is(err, pan115.ErrNotAuthorized):
+		status = http.StatusBadGateway
+	}
+	http.Error(w, http.StatusText(status), status)
+}
+
+type upstreamError struct {
+	status int
+	file   string
+}
+
+func (e *upstreamError) Error() string {
+	return "115 cdn refused the download link for " + e.file + ": HTTP " + strconv.Itoa(e.status)
+}
+
+// isExpired reports whether a CDN status means "this URL is no longer good"
+// rather than "this request was wrong".
+func isExpired(status int) bool {
+	switch status {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusGone:
+		return true
+	}
+	return false
+}
+
+// isClientGone reports whether an error just means the player hung up, which
+// happens constantly during seeking and is not worth logging as a failure.
+func isClientGone(err error) bool {
+	return errors.Is(err, context.Canceled) ||
+		errors.Is(err, syscall.EPIPE) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, net.ErrClosed)
+}
+
+// passthroughHeaders are copied from the CDN response as-is. Everything else,
+// notably Set-Cookie and any 115 session state, is dropped.
+var passthroughHeaders = []string{
+	"Content-Length",
+	"Content-Range",
+	"Accept-Ranges",
+	"Last-Modified",
+	"ETag",
+}
+
+func copyResponseHeaders(dst, src http.Header, entry pan115.Entry) {
+	for _, name := range passthroughHeaders {
+		if value := src.Get(name); value != "" {
+			dst.Set(name, value)
+		}
+	}
+	dst.Set("Accept-Ranges", "bytes")
+
+	// Prefer our own guess: the CDN labels nearly everything as a generic
+	// binary stream, which makes players fall back to sniffing.
+	if guess := contentType(entry.Name); guess != defaultContentType {
+		dst.Set("Content-Type", guess)
+	} else if value := src.Get("Content-Type"); value != "" {
+		dst.Set("Content-Type", value)
+	} else {
+		dst.Set("Content-Type", defaultContentType)
+	}
+}
+
+const defaultContentType = "application/octet-stream"
+
+// mediaTypes covers what the Go mime table misses. Container formats matter
+// most: players use the type to decide whether a file is worth opening.
+var mediaTypes = map[string]string{
+	".mkv": "video/x-matroska", ".mp4": "video/mp4", ".m4v": "video/x-m4v",
+	".avi": "video/x-msvideo", ".mov": "video/quicktime", ".wmv": "video/x-ms-wmv",
+	".flv": "video/x-flv", ".webm": "video/webm", ".mpg": "video/mpeg",
+	".mpeg": "video/mpeg", ".ts": "video/mp2t", ".m2ts": "video/mp2t",
+	".rmvb": "application/vnd.rn-realmedia-vbr", ".iso": "application/x-iso9660-image",
+	".m3u8": "application/vnd.apple.mpegurl",
+
+	".mp3": "audio/mpeg", ".flac": "audio/flac", ".aac": "audio/aac",
+	".m4a": "audio/mp4", ".wav": "audio/wav", ".ogg": "audio/ogg",
+	".opus": "audio/opus", ".ape": "audio/x-ape", ".wma": "audio/x-ms-wma",
+
+	".srt": "application/x-subrip", ".ass": "text/x-ssa", ".ssa": "text/x-ssa",
+	".vtt": "text/vtt", ".sub": "text/plain", ".idx": "text/plain",
+	".nfo": "text/plain",
+}
+
+func contentType(name string) string {
+	if t, ok := mediaTypes[strings.ToLower(path.Ext(name))]; ok {
+		return t
+	}
+	return defaultContentType
+}

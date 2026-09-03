@@ -1,0 +1,204 @@
+package dav
+
+import (
+	"context"
+	"errors"
+	"io/fs"
+	"reflect"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/q741451/115dav/internal/pan115"
+)
+
+// stubBackend serves fixed listings and counts calls. It never resolves.
+type stubBackend struct {
+	dirs  map[string][]pan115.Entry
+	calls atomic.Int64
+	delay time.Duration
+}
+
+func (s *stubBackend) List(_ context.Context, id string) ([]pan115.Entry, error) {
+	s.calls.Add(1)
+	time.Sleep(s.delay)
+	entries, ok := s.dirs[id]
+	if !ok {
+		return nil, pan115.ErrNotFound
+	}
+	return entries, nil
+}
+
+func (s *stubBackend) Resolve(context.Context, string) (*pan115.Target, error) {
+	return nil, errors.New("not used")
+}
+
+func TestSplitPath(t *testing.T) {
+	for path, want := range map[string][]string{
+		"/":          nil,
+		"":           nil,
+		"/a":         {"a"},
+		"a/b":        {"a", "b"},
+		"/a/b/":      {"a", "b"},
+		"/a//b":      {"a", "b"},
+		"/a/./b":     {"a", "b"},
+		"/a/b/../c":  {"a", "c"},
+		"/中文/片子.mkv": {"中文", "片子.mkv"},
+	} {
+		if got := splitPath(path); !reflect.DeepEqual(got, want) {
+			t.Errorf("splitPath(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
+func TestSanitiseName(t *testing.T) {
+	for name, want := range map[string]string{
+		"ordinary.mkv":  "ordinary.mkv",
+		"a/b.mkv":       "a_b.mkv",
+		"a\\b.mkv":      "a_b.mkv",
+		"tab\there.mkv": "tab_here.mkv",
+		".":             "_.",
+		"..":            "_..",
+		"":              "_",
+	} {
+		if got := sanitiseName(name); got != want {
+			t.Errorf("sanitiseName(%q) = %q, want %q", name, got, want)
+		}
+	}
+}
+
+// Two children with the same name would otherwise make one of them
+// unreachable, since paths are resolved by name.
+func TestDuplicateNamesAreDisambiguated(t *testing.T) {
+	dir := newDirectory([]pan115.Entry{
+		{ID: "1", Name: "film.mkv", PickCode: "a"},
+		{ID: "2", Name: "film.mkv", PickCode: "b"},
+		{ID: "3", Name: "film.mkv", PickCode: "c"},
+		{ID: "4", Name: "notes", PickCode: "d"},
+		{ID: "5", Name: "notes", PickCode: "e"},
+	}, time.Now().Add(time.Minute))
+
+	var names []string
+	for _, entry := range dir.entries {
+		names = append(names, entry.Name)
+	}
+	want := []string{"film.mkv", "film (2).mkv", "film (3).mkv", "notes", "notes (2)"}
+	if !reflect.DeepEqual(names, want) {
+		t.Fatalf("names = %q, want %q", names, want)
+	}
+
+	// Every entry must still be reachable by its displayed name.
+	for _, entry := range dir.entries {
+		found, ok := dir.byName[entry.Name]
+		if !ok {
+			t.Errorf("%q is not resolvable", entry.Name)
+			continue
+		}
+		if found.ID != entry.ID {
+			t.Errorf("%q resolves to id %s, want %s", entry.Name, found.ID, entry.ID)
+		}
+	}
+}
+
+func TestLookupWalksAndCaches(t *testing.T) {
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{
+		"0":  {{ID: "d1", Name: "Shows", IsDir: true}},
+		"d1": {{ID: "d2", Name: "S1", IsDir: true}},
+		"d2": {{ID: "f1", Name: "ep1.mkv", PickCode: "pc1", Size: 42}},
+	}}
+	tree := NewTree(backend, "0", time.Minute)
+
+	entry, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv")
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	if entry.ID != "f1" || entry.Size != 42 {
+		t.Fatalf("entry = %+v, want f1", entry)
+	}
+	if got := backend.calls.Load(); got != 3 {
+		t.Fatalf("list calls = %d, want 3", got)
+	}
+
+	if _, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv"); err != nil {
+		t.Fatal(err)
+	}
+	if got := backend.calls.Load(); got != 3 {
+		t.Errorf("list calls = %d after a cached lookup, want 3", got)
+	}
+}
+
+func TestLookupMissing(t *testing.T) {
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{
+		"0": {{ID: "f1", Name: "film.mkv", PickCode: "pc1"}},
+	}}
+	tree := NewTree(backend, "0", time.Minute)
+
+	for _, path := range []string{
+		"/nope.mkv",
+		"/film.mkv/deeper.mkv", // descending through a file
+	} {
+		if _, err := tree.Lookup(context.Background(), path); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("Lookup(%q) err = %v, want fs.ErrNotExist", path, err)
+		}
+	}
+}
+
+func TestExpiredListingIsRefetched(t *testing.T) {
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{
+		"0": {{ID: "f1", Name: "film.mkv"}},
+	}}
+	tree := NewTree(backend, "0", time.Nanosecond)
+
+	for range 3 {
+		if _, err := tree.Children(context.Background(), "0"); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := backend.calls.Load(); got != 3 {
+		t.Errorf("list calls = %d, want 3 once the TTL has lapsed each time", got)
+	}
+}
+
+// A media scanner opens many directories at once; concurrent misses on the
+// same directory must collapse into a single upstream call.
+func TestConcurrentMissesCollapse(t *testing.T) {
+	backend := &stubBackend{
+		dirs:  map[string][]pan115.Entry{"0": {{ID: "f1", Name: "film.mkv"}}},
+		delay: 20 * time.Millisecond,
+	}
+	tree := NewTree(backend, "0", time.Minute)
+
+	var wg sync.WaitGroup
+	for range 16 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := tree.Children(context.Background(), "0"); err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := backend.calls.Load(); got != 1 {
+		t.Errorf("list calls = %d, want 1", got)
+	}
+}
+
+func TestForgetDropsCache(t *testing.T) {
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{"0": {{ID: "f1", Name: "a.mkv"}}}}
+	tree := NewTree(backend, "0", time.Hour)
+
+	if _, err := tree.Children(context.Background(), "0"); err != nil {
+		t.Fatal(err)
+	}
+	tree.Forget("0")
+	if _, err := tree.Children(context.Background(), "0"); err != nil {
+		t.Fatal(err)
+	}
+	if got := backend.calls.Load(); got != 2 {
+		t.Errorf("list calls = %d, want 2", got)
+	}
+}
