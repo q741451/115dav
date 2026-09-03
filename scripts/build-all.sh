@@ -46,6 +46,11 @@ readonly TARGETS=(
 	"freebsd/amd64"
 )
 
+# Fail on a missing tool now rather than eight targets into the run.
+for tool in go tar gzip zip sha256sum; do
+	command -v "$tool" >/dev/null || { echo "build-all: $tool is not installed" >&2; exit 1; }
+done
+
 rm -rf "$OUT"
 mkdir -p "$OUT/bin"
 

@@ -19,13 +19,14 @@ ARG GO_SHA256_amd64=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf59016
 ARG GO_SHA256_arm64=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec
 
 RUN set -eux; \
-	# ca-certificates and curl are needed to fetch the toolchain and the
-	# modules; gcc and libc6-dev exist only so `go test -race` can run.
+	# ca-certificates and curl fetch the toolchain and the modules; zip packs
+	# the Windows archives; gcc and libc6-dev exist only so `go test -race`
+	# can run.
 	# None of them reach a release binary, which is built with CGO_ENABLED=0
 	# and therefore links nothing from this system -- so the exact package
 	# versions apt happens to serve cannot change the output.
 	apt-get update; \
-	apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev; \
+	apt-get install -y --no-install-recommends ca-certificates curl zip gcc libc6-dev; \
 	rm -rf /var/lib/apt/lists/*; \
 	\
 	arch="$(dpkg --print-architecture)"; \
