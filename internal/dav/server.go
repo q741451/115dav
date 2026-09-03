@@ -4,7 +4,8 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
-	"html/template"
+	"html"
+	"io"
 	"io/fs"
 	"log/slog"
 	"net/http"
@@ -166,45 +167,34 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request, entry pan115
 	if !strings.HasSuffix(base, "/") {
 		base += "/"
 	}
-	rows := make([]indexRow, 0, len(children))
+	// Built by hand rather than with html/template: executing a template
+	// drags the whole reflect-based template engine into the binary, which
+	// costs more than two megabytes for what is one debugging page. Every
+	// interpolation below is escaped explicitly instead.
+	var page strings.Builder
+	title := html.EscapeString(path.Clean("/" + base))
+	page.WriteString(`<!doctype html><meta charset="utf-8"><title>`)
+	page.WriteString(title)
+	page.WriteString(`</title><style>body{font:14px system-ui;margin:2rem}td{padding:.15rem 1rem .15rem 0}
+td.s{text-align:right;color:#666;font-variant-numeric:tabular-nums}</style><h1>`)
+	page.WriteString(title)
+	page.WriteString("</h1><table>\n")
 	for _, child := range children {
 		name := child.Name
 		if child.IsDir {
 			name += "/"
 		}
-		rows = append(rows, indexRow{
-			Name: name,
-			Href: template.URL((&url.URL{Path: base + child.Name}).EscapedPath()),
-			Size: humanSize(child),
-		})
+		href := (&url.URL{Path: base + child.Name}).EscapedPath()
+		page.WriteString(`<tr><td><a href="` + html.EscapeString(href) + `">` +
+			html.EscapeString(name) + `</a></td><td class="s">` +
+			humanSize(child) + // digits and a unit, nothing to escape
+			"</td></tr>\n")
 	}
-
-	if err := indexTemplate.Execute(w, indexPage{Path: path.Clean("/" + base), Rows: rows}); err != nil {
-		s.log.Warn("index render failed", "err", err)
+	page.WriteString("</table>\n")
+	if _, err := io.WriteString(w, page.String()); err != nil {
+		s.log.Debug("index write failed", "err", err)
 	}
 }
-
-type indexPage struct {
-	Path string
-	Rows []indexRow
-}
-
-type indexRow struct {
-	Name string
-	Href template.URL
-	Size string
-}
-
-// A directory index is not needed by WebDAV clients; it exists so the mount
-// can be sanity-checked in a browser.
-var indexTemplate = template.Must(template.New("index").Parse(
-	`<!doctype html><meta charset="utf-8"><title>{{.Path}}</title>
-<style>body{font:14px system-ui;margin:2rem}td{padding:.15rem 1rem .15rem 0}
-td.s{text-align:right;color:#666;font-variant-numeric:tabular-nums}</style>
-<h1>{{.Path}}</h1><table>
-{{range .Rows}}<tr><td><a href="{{.Href}}">{{.Name}}</a></td><td class="s">{{.Size}}</td></tr>
-{{end}}</table>
-`))
 
 func humanSize(entry pan115.Entry) string {
 	if entry.IsDir {
