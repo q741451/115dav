@@ -58,7 +58,7 @@ go build -o 115dav .
 go test ./...
 ```
 
-需要 Go 1.25+。依赖只有 `golang.org/x/{net,sync,time}`。
+需要 Go 1.22。依赖只有 `golang.org/x/{net,sync,time}`。
 
 交叉编译全部平台（和 CI 用同一份脚本，产物在 `dist/`）：
 
@@ -71,6 +71,8 @@ VERSION=v0.1.0 scripts/build-all.sh
 push 自动测试并交叉编译十个平台；push `v*` tag 自动发 Release；也可以在 Actions 页面手动 Run workflow 并勾选发布。
 
 编译环境全部定义在 `.github/builder/Dockerfile`：Ubuntu 22.04 按 digest 钉死，里面装指定版本并校验过 sha256 的 Go。编译器不在宿主机上跑，所以 CI 一律用 `ubuntu-latest`（GitHub 唯一不会删的标签），环境也不会跟着它动。
+
+Go 特意压在 1.22（源码能编的最低版本）——之后每个版本产物都更大，1.22 比 1.27 小约 1.5 MB。代价是它已过维护期，二进制里的 `crypto/tls` 和 `net/http` 不再收安全补丁，把端口开到可信网络之外前请掂量。
 
 构建是可复现的：同一个 commit 在不同机器上编，二进制和归档逐字节相同。升级 Ubuntu 或 Go 都只改 Dockerfile 里对应那几行。
 

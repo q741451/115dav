@@ -12,11 +12,18 @@
 FROM ubuntu:22.04@sha256:2edbbc5dc405e9612ba3584ce95480277e3eb374407b5505fe26f17df77c7dbc
 
 # The Go toolchain, fetched and verified rather than inherited from somebody
-# else's image. To upgrade, change these three lines together; the checksums
+# else's image. To change it, edit these three lines together; the checksums
 # are published at https://go.dev/dl/
-ARG GO_VERSION=1.27.1
-ARG GO_SHA256_amd64=63d339f0da5ab53635a56f2490a7984dfe12dfcff22ad749f63edaf590168445
-ARG GO_SHA256_arm64=3450b45a3f9ee8568792736a5c5e70a1f2e9b36c35a8f74958c03e51d7d92bec
+#
+# Held at 1.22 deliberately, for binary size: each release since has grown
+# the output, and 1.22 is the oldest the source still compiles on (it uses
+# range-over-int). Measured on linux/amd64, 1.22 is about 1.5 MB smaller
+# than 1.27. The cost is that this is past end of life, so the crypto/tls
+# and net/http in the release binaries no longer receive fixes -- worth
+# knowing before exposing the port beyond a trusted network.
+ARG GO_VERSION=1.22.12
+ARG GO_SHA256_amd64=4fa4f869b0f7fc6bb1eb2660e74657fbf04cdd290b5aef905585c86051b34d43
+ARG GO_SHA256_arm64=fd017e647ec28525e86ae8203236e0653242722a7436929b1f775744e26278e7
 
 RUN set -eux; \
 	# ca-certificates and curl fetch the toolchain and the modules; zip packs

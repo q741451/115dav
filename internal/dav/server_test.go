@@ -125,7 +125,7 @@ func newTestServer(t *testing.T, b *fakeBackend, opts Options) *httptest.Server 
 	if opts.LinkTTL == 0 {
 		opts.LinkTTL = time.Hour
 	}
-	opts.Logger = slog.New(slog.DiscardHandler)
+	opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	srv := httptest.NewServer(New(opts))
 	t.Cleanup(srv.Close)
