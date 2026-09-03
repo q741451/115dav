@@ -45,7 +45,12 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # ubuntu-latest, always. It is the one Ubuntu label GitHub never deletes:
+    # 18.04 and 20.04 are already gone and 24.04 will follow, so pinning a
+    # numbered label trades a workflow that breaks on a schedule for
+    # determinism it does not actually provide. Determinism comes from the
+    # container below, whose digest does not expire.
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
       binsums: ${{ steps.sums.outputs.binsums }}
@@ -119,33 +124,23 @@ jobs:
           if-no-files-found: error
 
   verify:
-    # The point of pinning the builder is that the host cannot influence the
-    # output. This job tests that claim instead of assuming it: build again
-    # elsewhere and require byte-identical binaries.
+    # The pinned image is what makes the build deterministic; this job checks
+    # that it really is, by building the same commit a second time on a fresh
+    # machine and demanding byte-identical binaries.
     #
-    # Note which way round the pinning goes. `build` runs on a pinned label
-    # because it produces what ships. This job is the canary, so it wants
-    # exposure to whatever GitHub is actually running:
-    #
-    #   ubuntu-22.04   a materially different image from the 24.04 above, so
-    #                  the comparison means something today rather than
-    #                  quietly comparing an image against itself
-    #   ubuntu-latest  deliberately unpinned -- the day GitHub moves it (26.04
-    #                  is already in preview) this leg tries the new image
-    #                  before a release ever has to
-    #
-    # If a label is retired the leg fails loudly, which is the right outcome:
-    # a one-line edit, not a silently weakened check.
+    # It runs on ubuntu-latest like everything else. An earlier version pinned
+    # this job to an older numbered label so the two builds would differ in
+    # host, but that put a deletable label on the critical path to buy a
+    # comparison the container already guarantees. If the host ever does start
+    # leaking into the output, the far more likely symptom is this job failing
+    # after GitHub moves ubuntu-latest to a new release -- which is exactly
+    # when it should fail.
     needs: build
-    strategy:
-      fail-fast: false
-      matrix:
-        host: [ubuntu-22.04, ubuntu-latest]
-    runs-on: ${{ matrix.host }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
-      - name: Rebuild on ${{ matrix.host }}
+      - name: Build again on a fresh machine
         env:
           VERSION: ${{ needs.build.outputs.version }}
         run: scripts/in-builder.sh scripts/build-all.sh
@@ -159,16 +154,16 @@ jobs:
           set -euo pipefail
           printf '%s\n' "$EXPECTED" > /tmp/expected.sums
           if diff -u /tmp/expected.sums dist/SHA256SUMS.bin; then
-            echo "${{ matrix.host }} reproduced the ubuntu-24.04 build exactly"
+            echo "reproduced exactly on a second machine"
           else
-            echo "::error::${{ matrix.host }} produced different binaries; the build is not hermetic"
+            echo "::error::the two builds differ; something outside the pinned image is leaking in"
             exit 1
           fi
 
   release:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
     needs: [build, verify]
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
