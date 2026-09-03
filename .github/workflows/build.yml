@@ -26,30 +26,15 @@ concurrency:
   # Never discard a tag build half way; superseded branch builds are fine to drop.
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
-env:
-  # ─────────────────────────────────────────────────────────────────────────
-  # The build environment, in one line.
-  #
-  # This is golang:1.27.1-bookworm pinned by digest. A tag can be repointed at
-  # new content by whoever publishes it; a digest is the content. Because the
-  # compiler only ever runs inside this image, the runner's own OS -- which
-  # GitHub rebuilds continuously and eventually retires -- contributes nothing
-  # to the binaries, and the `verify` job below proves that rather than
-  # assuming it.
-  #
-  # To move to a newer Go: change this line, and nothing else.
-  # To find the digest:
-  #   docker buildx imagetools inspect golang:1.28.0-bookworm | head -2
-  # ─────────────────────────────────────────────────────────────────────────
-  BUILDER: golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b
-
 jobs:
   build:
     # ubuntu-latest, always. It is the one Ubuntu label GitHub never deletes:
     # 18.04 and 20.04 are already gone and 24.04 will follow, so pinning a
-    # numbered label trades a workflow that breaks on a schedule for
-    # determinism it does not actually provide. Determinism comes from the
-    # container below, whose digest does not expire.
+    # numbered label buys a workflow that breaks on a schedule, in exchange
+    # for determinism it cannot provide anyway. The environment that decides
+    # what the binaries look like is .github/builder/Dockerfile -- Ubuntu
+    # 22.04 by digest, plus a checksum-verified Go -- and every step below
+    # runs inside it.
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -125,16 +110,10 @@ jobs:
 
   verify:
     # The pinned image is what makes the build deterministic; this job checks
-    # that it really is, by building the same commit a second time on a fresh
-    # machine and demanding byte-identical binaries.
-    #
-    # It runs on ubuntu-latest like everything else. An earlier version pinned
-    # this job to an older numbered label so the two builds would differ in
-    # host, but that put a deletable label on the critical path to buy a
-    # comparison the container already guarantees. If the host ever does start
-    # leaking into the output, the far more likely symptom is this job failing
-    # after GitHub moves ubuntu-latest to a new release -- which is exactly
-    # when it should fail.
+    # that it really is, by rebuilding the same commit on a second fresh
+    # machine and demanding byte-identical binaries. Anything that leaks in
+    # from outside the image -- a timestamp, a path, the runner's own state --
+    # shows up here rather than in a release.
     needs: build
     runs-on: ubuntu-latest
     steps:

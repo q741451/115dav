@@ -70,7 +70,9 @@ VERSION=v0.1.0 scripts/build-all.sh
 
 push 自动测试并交叉编译十个平台；push `v*` tag 自动发 Release；也可以在 Actions 页面手动 Run workflow 并勾选发布。
 
-编译器只在 digest 钉死的容器里跑，构建可复现 —— 同一个 commit 编两次，二进制和归档逐字节相同，`verify` job 每次都会重编一遍验证这点。升级 Go 只改 `.github/workflows/build.yml` 里 `BUILDER:` 那一行，理由写在该文件的注释里。
+编译环境全部定义在 `.github/builder/Dockerfile`：Ubuntu 22.04 按 digest 钉死，里面装指定版本并校验过 sha256 的 Go。编译器不在宿主机上跑，所以 CI 一律用 `ubuntu-latest`（GitHub 唯一不会删的标签），环境也不会跟着它动。
+
+构建是可复现的 —— 同一个 commit 编两次，二进制和归档逐字节相同，`verify` job 每次都会在另一台机器上重编一遍验证。升级 Ubuntu 或 Go 都只改 Dockerfile 里对应那几行。
 
 ## 状态
 
