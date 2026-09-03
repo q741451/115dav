@@ -1,4 +1,4 @@
-// Command pan115dav serves a 115 account as a read-only WebDAV mount, so that
+// Command 115dav serves a 115 account as a read-only WebDAV mount, so that
 // players such as Infuse can stream from it directly.
 //
 // File bytes are proxied rather than redirected: 115 ties each download URL to
@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -24,30 +25,39 @@ import (
 	"github.com/q741451/115dav/internal/pan115"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=...".
+// Builds made outside the release workflow keep the placeholder.
+var version = "dev"
+
 type options struct {
-	listen     string
-	cookie     string
-	cookieFile string
-	root       string
-	username   string
-	password   string
-	dirTTL     time.Duration
-	linkTTL    time.Duration
-	rate       float64
-	pageSize   int
-	userAgent  string
-	verbose    bool
+	listen      string
+	cookie      string
+	cookieFile  string
+	root        string
+	username    string
+	password    string
+	dirTTL      time.Duration
+	linkTTL     time.Duration
+	rate        float64
+	pageSize    int
+	userAgent   string
+	verbose     bool
+	showVersion bool
 }
 
 func main() {
 	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "pan115dav:", err)
+		fmt.Fprintln(os.Stderr, "115dav:", err)
 		os.Exit(1)
 	}
 }
 
 func run() error {
 	opts := parseFlags()
+	if opts.showVersion {
+		fmt.Printf("115dav %s %s/%s %s\n", version, runtime.GOOS, runtime.GOARCH, runtime.Version())
+		return nil
+	}
 
 	level := slog.LevelInfo
 	if opts.verbose {
@@ -172,10 +182,11 @@ func parseFlags() options {
 	flag.IntVar(&opts.pageSize, "page-size", pan115.DefaultPageSize, "directory listing page size (max 1150)")
 	flag.StringVar(&opts.userAgent, "ua", pan115.DefaultUserAgent, "User-Agent to present to 115")
 	flag.BoolVar(&opts.verbose, "v", false, "log every request")
+	flag.BoolVar(&opts.showVersion, "version", false, "print the version and exit")
 
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
-		fmt.Fprintf(out, "pan115dav serves a 115 account as a read-only WebDAV mount.\n\n")
+		fmt.Fprintf(out, "115dav %s serves a 115 account as a read-only WebDAV mount.\n\n", version)
 		fmt.Fprintf(out, "usage: %s -cookie 'UID=..; CID=..; SEID=..' [flags]\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}

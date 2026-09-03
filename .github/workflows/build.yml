@@ -1,0 +1,177 @@
+name: build
+
+# push        -> test and cross-compile, artifacts attached to the run
+# push a v tag -> the same, then publish a GitHub Release
+# Run workflow -> the same, and publish only if you tick the box
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub Release
+        type: boolean
+        default: false
+      tag:
+        description: Tag to release as, e.g. v0.1.0 (required when publishing)
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  # Never discard a tag build half way; superseded branch builds are fine to drop.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  # ─────────────────────────────────────────────────────────────────────────
+  # The build environment, in one line.
+  #
+  # This is golang:1.27.1-bookworm pinned by digest. A tag can be repointed at
+  # new content by whoever publishes it; a digest is the content. Because the
+  # compiler only ever runs inside this image, the runner's own OS -- which
+  # GitHub rebuilds continuously and eventually retires -- contributes nothing
+  # to the binaries, and the `verify` job below proves that rather than
+  # assuming it.
+  #
+  # To move to a newer Go: change this line, and nothing else.
+  # To find the digest:
+  #   docker buildx imagetools inspect golang:1.28.0-bookworm | head -2
+  # ─────────────────────────────────────────────────────────────────────────
+  BUILDER: golang:1.27.1-bookworm@sha256:648f440f42a0958804efb24df176f806f9d353b41f1c0627f666428e40310f6b
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      binsums: ${{ steps.sums.outputs.binsums }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Decide the version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            version="${GITHUB_REF_NAME}"
+          elif [ -n "${INPUT_TAG}" ]; then
+            version="${INPUT_TAG}"
+          else
+            if [ "${INPUT_PUBLISH}" = true ]; then
+              echo "::error::publishing from the web UI needs a tag, e.g. v0.1.0"
+              exit 1
+            fi
+            version="0.0.0-$(git rev-parse --short=12 HEAD)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "building ${version}"
+
+      - name: Check formatting
+        run: |
+          set -euo pipefail
+          unformatted="$(scripts/in-builder.sh gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::not gofmt-clean:"$'\n'"$unformatted"
+            exit 1
+          fi
+
+      - name: Verify the module graph
+        run: scripts/in-builder.sh go mod verify
+
+      - name: Vet
+        run: scripts/in-builder.sh go vet ./...
+
+      - name: Test
+        # The race detector is the one thing here that needs cgo, so it is the
+        # one place CGO_ENABLED is not zero. Release binaries never are.
+        run: CGO_ENABLED=1 scripts/in-builder.sh go test -race -count=1 ./...
+
+      - name: Cross-compile every target
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: scripts/in-builder.sh scripts/build-all.sh
+
+      - name: Record the binary checksums
+        id: sums
+        run: |
+          set -euo pipefail
+          {
+            echo 'binsums<<CHECKSUMS'
+            cat dist/SHA256SUMS.bin
+            echo 'CHECKSUMS'
+          } >> "$GITHUB_OUTPUT"
+          cat dist/SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  verify:
+    # The point of pinning the builder is that the host cannot influence the
+    # output. This job is the test of that claim: build again on a different
+    # runner image and require byte-identical binaries. If GitHub ever ships a
+    # host change that leaks into the build, this goes red instead of the
+    # release silently shipping something else.
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Rebuild on a different host image
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+        run: scripts/in-builder.sh scripts/build-all.sh
+
+      - name: Compare against the first build
+        env:
+          # Through the environment, not string interpolation, so the contents
+          # can never be read as shell.
+          EXPECTED: ${{ needs.build.outputs.binsums }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$EXPECTED" > /tmp/expected.sums
+          if diff -u /tmp/expected.sums dist/SHA256SUMS.bin; then
+            echo "identical on ubuntu-24.04 and ubuntu-22.04 — the build is hermetic"
+          else
+            echo "::error::the host image changed the output; the build is not hermetic"
+            exit 1
+          fi
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
+    needs: [build, verify]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Creates the tag too, when the run was started from the web UI.
+          gh release create "$VERSION" \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
+            --generate-notes \
+            dist/*.tar.gz dist/*.zip dist/SHA256SUMS

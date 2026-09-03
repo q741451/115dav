@@ -73,6 +73,55 @@ go test ./...
 
 需要 Go 1.25+（`go build` 会按需自动下载工具链）。依赖只有 `golang.org/x/{net,sync,time}`。
 
+交叉编译全部平台，和 CI 用的是同一份脚本：
+
+```
+VERSION=v0.1.0 scripts/build-all.sh      # 产物在 dist/
+```
+
+## CI 与发布
+
+`.github/workflows/build.yml`：
+
+| 触发 | 行为 |
+| --- | --- |
+| push 任意分支 | gofmt / vet / `go test -race` / 交叉编译十个平台，产物挂在 run 上 |
+| push `v*` tag | 同上，然后自动发 Release |
+| 网页 Run workflow | 同上，勾选 Publish 并填 tag 才发布 |
+
+### 编译环境是钉死的
+
+产物只应该取决于源码、依赖和工具链，不该取决于哪台机器编的。所以：
+
+- **编译器只在 digest 钉死的容器里跑**（`golang:1.27.1-bookworm@sha256:648f44…`）。钉 digest 不钉 tag —— tag 能被发布者重新指向，digest 就是内容本身。宿主 runner 只负责起进程，它的 OS 怎么更新都碰不到产物。
+- **`GOTOOLCHAIN=local`**。这条最容易漏：否则 `go.mod` 里的 go 指令会让 Go 自己下载另一个版本的工具链，容器白钉了。
+- **`CGO_ENABLED=0` + 全部交叉编译**。不link系统 libc，不用 macOS/Windows runner，少两套会漂移的环境。
+- **依赖由 `go.sum` 按哈希锁定**，CI 里跑 `go mod verify`。
+
+升级 Go 只需要改 workflow 里 `BUILDER:` 那一行。新 digest 这样取：
+
+```
+docker buildx imagetools inspect golang:1.28.0-bookworm | head -2
+```
+
+### 不是假设，是验证
+
+`verify` job 会在**另一个** runner 镜像（ubuntu-22.04，主构建是 24.04）上用同一个容器重新编一遍，比对二进制的 SHA256。对得上才算数。哪天 GitHub 换镜像真的把构建弄脏了，这个 job 会直接红掉，而不是让 Release 悄悄发出一个不一样的东西。
+
+构建本身是可复现的（`-trimpath` / `-buildvcs=false` / `-buildid=` / 归档时间戳归一），同一个 commit 编两次，二进制和归档都逐字节相同。
+
+### 一个还没做完的点
+
+workflow 里的 action 目前钉到大版本（`actions/checkout@v5` 这种），**没有钉到 commit SHA** —— 写这份代码的环境访问不了 GitHub API，解析不出 SHA，我不想编一个假的进去。要钉死的话在你自己机器上跑：
+
+```
+gh api repos/actions/checkout/commits/v5 --jq .sha
+gh api repos/actions/upload-artifact/commits/v4 --jq .sha
+gh api repos/actions/download-artifact/commits/v4 --jq .sha
+```
+
+然后把 `@v5` 换成 `@<sha> # v5`。仓库里的 `.github/dependabot.yml` 已经配好，钉了 SHA 之后 Dependabot 会继续按周提 PR 帮你升级 —— 钉死但不烂掉。
+
 ## 协议实现说明
 
 取链接口 `POST proapi.115.com/app/chrome/downurl` 的请求体和响应体都套了两层信封（一层自定义 XOR + 一层 RSA），必须逐字节一致才会被服务端接受，实现在 `internal/pan115/crypto.go`。
