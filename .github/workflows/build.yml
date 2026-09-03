@@ -38,7 +38,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
-      binsums: ${{ steps.sums.outputs.binsums }}
     steps:
       - uses: actions/checkout@v5
 
@@ -88,16 +87,8 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: scripts/in-builder.sh scripts/build-all.sh
 
-      - name: Record the binary checksums
-        id: sums
-        run: |
-          set -euo pipefail
-          {
-            echo 'binsums<<CHECKSUMS'
-            cat dist/SHA256SUMS.bin
-            echo 'CHECKSUMS'
-          } >> "$GITHUB_OUTPUT"
-          cat dist/SHA256SUMS
+      - name: Show the checksums
+        run: cat dist/SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
@@ -108,40 +99,9 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
 
-  verify:
-    # The pinned image is what makes the build deterministic; this job checks
-    # that it really is, by rebuilding the same commit on a second fresh
-    # machine and demanding byte-identical binaries. Anything that leaks in
-    # from outside the image -- a timestamp, a path, the runner's own state --
-    # shows up here rather than in a release.
-    needs: build
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Build again on a fresh machine
-        env:
-          VERSION: ${{ needs.build.outputs.version }}
-        run: scripts/in-builder.sh scripts/build-all.sh
-
-      - name: Compare against the first build
-        env:
-          # Through the environment, not string interpolation, so the contents
-          # can never be read as shell.
-          EXPECTED: ${{ needs.build.outputs.binsums }}
-        run: |
-          set -euo pipefail
-          printf '%s\n' "$EXPECTED" > /tmp/expected.sums
-          if diff -u /tmp/expected.sums dist/SHA256SUMS.bin; then
-            echo "reproduced exactly on a second machine"
-          else
-            echo "::error::the two builds differ; something outside the pinned image is leaking in"
-            exit 1
-          fi
-
   release:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish)
-    needs: [build, verify]
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write

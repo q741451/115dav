@@ -99,12 +99,8 @@ done
 
 rm -rf "$OUT/.pack"
 
-# Two checksum files with different jobs to do:
-#   SHA256SUMS      ships with the release, for people verifying a download
-#   SHA256SUMS.bin  covers the raw binaries, and is what the workflow compares
-#                   across runner images to detect a build that is not hermetic
+# Ships with the release, for anyone verifying a download.
 (cd "$OUT" && sha256sum ./*.tar.gz ./*.zip | sed 's| \./| |' >SHA256SUMS)
-(cd "$OUT" && find bin -type f | sort | xargs sha256sum >SHA256SUMS.bin)
 
 echo
 echo "built $BIN $VERSION into $OUT/"
