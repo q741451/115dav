@@ -108,12 +108,17 @@ func run() error {
 		return err
 	}
 
-	// Cancelled at shutdown, which retires the credentials in use and with
-	// them the listings and resolves begun under those credentials. Streaming
-	// a file is not shared work and is not cancelled here; the HTTP server's
-	// own drain window covers that.
-	ctx, retire := context.WithCancel(context.Background())
-	defer retire()
+	// Cancelled at shutdown, which stops the listings and resolves begun under
+	// the credentials in use. Streaming a file is not shared work and is not
+	// cancelled here; the HTTP server's own drain window covers that.
+	//
+	// Cancelling is all that shutdown needs, and Server.Close is deliberately
+	// not called: it takes the lock that a credential fetch holds, and a fetch
+	// waiting on an unreachable cookie server would then hold up the exit for
+	// as long as its own timeout -- half a minute of a router refusing to
+	// reboot, to release a reference the process is about to drop anyway.
+	ctx, stopSharedWork := context.WithCancel(context.Background())
+	defer stopSharedWork()
 
 	handler := dav.New(ctx, dav.Options{
 		Credentials: creds,
@@ -125,7 +130,6 @@ func run() error {
 		RetryAfter:  opts.cookieRetry,
 		Logger:      log,
 	})
-	defer handler.Close()
 
 	server := &http.Server{
 		Addr:    opts.listen,

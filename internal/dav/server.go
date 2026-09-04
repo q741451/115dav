@@ -216,6 +216,13 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 		return content{epoch: e, entry: entry, id: id, resp: resp}, err
 	})
 	if err != nil {
+		// open returns no response alongside an error, so this closes nothing
+		// today. It is here because the alternative to stating the invariant is
+		// depending on it silently: a later change that returns both would leak
+		// a connection per failed request, and nothing would say so.
+		if got.resp != nil {
+			got.resp.Body.Close()
+		}
 		s.replyError(w, r, got.entry, err)
 		return
 	}

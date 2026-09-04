@@ -892,3 +892,38 @@ func TestAnExpiryFoundAtResolveTimeStillRecovers(t *testing.T) {
 		t.Errorf("credentials handed out %d times and rejected %d, want 2 and 1", handed, rejected)
 	}
 }
+
+// A cookie given on the command line cannot be replaced without a restart, so
+// once 115 stops accepting it there is nothing a retry can do. Retrying anyway
+// would cost a second API call and throw away the caches on every request from
+// then on -- and since the rebuilt epoch is built from the same dead cookie,
+// it would never stop.
+func TestAnUnreplaceableLoginIsNotRetried(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{Credentials: Static{B: b}, DirTTL: time.Hour})
+
+	// Warm the listing so there is something worth not throwing away.
+	if resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("warm-up = %d, want 207", resp.StatusCode)
+	}
+
+	b.failResolves(pan115.ErrNotAuthorized)
+	before := b.resolveCalls.Load()
+
+	resp := do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502 -- an expired static cookie is not a temporary shortage", resp.StatusCode)
+	}
+	if n := b.resolveCalls.Load() - before; n != 1 {
+		t.Errorf("the download endpoint was called %d times for one dead cookie, want 1", n)
+	}
+
+	// The listing is still there: nothing was gained by discarding it.
+	listed := b.listCalls.Load()
+	if resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
+		t.Errorf("PROPFIND after the failure = %d, want 207 from the warm cache", resp.StatusCode)
+	}
+	if b.listCalls.Load() != listed {
+		t.Error("the cached listing was thrown away, though there was no replacement to build a new one from")
+	}
+}

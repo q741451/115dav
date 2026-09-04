@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"sync"
 
 	"github.com/q741451/115dav/internal/pan115"
@@ -112,24 +113,56 @@ func (e *epochs) get(ctx context.Context) (*epoch, error) {
 	return e.current, nil
 }
 
-// retire drops the epoch if it is still the current one, and cancels the work
-// it owns.
+// rotate replaces an epoch whose credentials 115 has refused, and reports nil
+// when there is nothing to replace it with.
 //
-// The comparison is what makes concurrent reports of the same failure safe:
-// several requests will notice one expired login at once, and only the first
-// of them replaces anything. Comparing pointers rather than cookies also means
-// no part of this has to know what a credential looks like.
-func (e *epochs) retire(stale *epoch) {
+// The source is asked for a replacement before anything is discarded. That
+// ordering is the whole point. A cookie given on the command line cannot be
+// replaced without a restart, so retiring the epoch built from it would throw
+// away listings that are still the best answer available and gain nothing --
+// and since the next request would rebuild and fail all over again, a dead
+// cookie would cost two API calls and a cold cache on every request from then
+// on, forever.
+//
+// Comparing pointers is also what makes concurrent reports of one expiry safe:
+// several requests notice it at once, and only the first replaces anything.
+func (e *epochs) rotate(ctx context.Context, stale *epoch) (*epoch, error) {
 	e.mu.Lock()
-	replaced := e.current == stale
-	if replaced {
-		e.current = nil
-	}
-	e.mu.Unlock()
+	defer e.mu.Unlock()
 
-	if replaced {
-		stale.cancel()
+	// Someone else has already dealt with this one; their replacement is what
+	// to use. A nil current means the server is closing, which is not the
+	// moment to start fetching credentials.
+	if e.current != stale {
+		return e.current, nil
 	}
+
+	backend, err := e.creds.Backend(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", errNoCredentials, err)
+	}
+	if sameBackend(backend, stale.backend) {
+		return nil, nil
+	}
+
+	e.current = newEpoch(e.owner, backend, e.opts)
+	stale.cancel()
+	return e.current, nil
+}
+
+// sameBackend reports whether the source handed back what it had before.
+//
+// The comparability check is not idle: comparing interface values panics when
+// the dynamic type cannot be compared, every implementation here is a pointer
+// so it cannot happen today, and a panic inside a request handler would be a
+// poor way to discover that a later one is not. An incomparable backend is
+// treated as different, which costs a rebuild rather than a crash.
+func sameBackend(a, b Backend) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	t := reflect.TypeOf(a)
+	return t == reflect.TypeOf(b) && t.Comparable() && a == b
 }
 
 // close retires whatever is current, for shutdown.
@@ -162,21 +195,25 @@ func withEpoch[T any](e *epochs, ctx context.Context, op func(*epoch) (T, error)
 		return result, err
 	}
 
-	// 115 no longer accepts what this epoch was built from. Everything derived
-	// from it goes with it; whatever the source produces next is a clean start,
-	// possibly on a different account entirely.
+	// 115 no longer accepts what this epoch was built from. If the source has
+	// something else, everything derived from the old credentials goes with
+	// them: the channel may by then hold a different account entirely, whose
+	// directory ids and pick codes mean nothing here.
 	e.log.Info("115 rejected the current credentials, asking for new ones")
 	e.creds.Reject(current.backend)
-	e.retire(current)
 
-	fresh, err := e.get(ctx)
-	if err != nil {
+	fresh, rotateErr := e.rotate(ctx, current)
+	switch {
+	case rotateErr != nil:
+		// The source could not produce any, which it says is temporary --
+		// a blackout waiting for someone to upload a fresh login.
+		return zero, rotateErr
+	case fresh == nil:
+		// The source has nothing else and is not going to: a cookie given on
+		// the command line. What 115 said is the accurate answer and the
+		// permanent one, so report that rather than dressing it up as a
+		// shortage of credentials, and leave the caches alone.
 		return zero, err
-	}
-	if fresh == current {
-		// The source handed back the credentials 115 just refused. Trying them
-		// again would only earn the same answer.
-		return zero, errNoCredentials
 	}
 	return op(fresh)
 }

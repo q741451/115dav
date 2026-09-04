@@ -48,6 +48,10 @@ const maxCachedLinks = 2048
 // resolveTimeout bounds a resolve that no longer has a caller waiting for it.
 const resolveTimeout = time.Minute
 
+// maxDiscardedBody is how much of a refused response is read before giving up
+// on reusing its connection.
+const maxDiscardedBody = 4 << 10
+
 func newLinkCache(owner context.Context, backend Backend, ttl time.Duration) *linkCache {
 	return &linkCache{owner: owner, backend: backend, ttl: ttl, items: map[string]cachedLink{}}
 }
@@ -71,6 +75,12 @@ func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, e
 		target, err := c.backend.Resolve(fetch, pickCode)
 		if err != nil {
 			return nil, err
+		}
+		if target == nil {
+			// No implementation does this, but the alternative to checking is
+			// caching a nil and dereferencing it one call later, in a place
+			// with no clue as to where it came from.
+			return nil, fmt.Errorf("115 returned no download target for pick code %s", pickCode)
 		}
 		c.store(pickCode, target)
 		return target, nil
@@ -142,6 +152,7 @@ func (c *linkCache) forget(pickCode string, failed *pan115.Target) {
 // Proxying rather than redirecting is deliberate: a CDN URL is tied to the
 // User-Agent and session that requested it, which a player would not reproduce
 // if it were sent there directly.
+//
 // The link cache is not here: it is derived from credentials and belongs to
 // an epoch. What this holds instead lasts as long as the process, because none
 // of it carries any 115 identity -- the cookies ride on each request, copied
@@ -169,8 +180,14 @@ func newStreamer(log *slog.Logger) *streamer {
 				TLSHandshakeTimeout:   15 * time.Second,
 				ResponseHeaderTimeout: 30 * time.Second,
 				IdleConnTimeout:       90 * time.Second,
-				MaxIdleConnsPerHost:   8,
-				ForceAttemptHTTP2:     true,
+				// Both caps matter. 115 hands out CDN hostnames that vary by
+				// file and by region, so a per-host limit alone bounds nothing
+				// in total: without MaxIdleConns a library walk can leave an
+				// idle connection, and a descriptor, for every host it touched
+				// until the idle timeout reaps them. Zero would mean no limit.
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 8,
+				ForceAttemptHTTP2:   true,
 			},
 		},
 		log:  log,
@@ -332,6 +349,13 @@ func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identi
 		case !isExpired(resp.StatusCode):
 			return resp, nil
 		default:
+			// Drained, not just closed. HTTP/1.1 cannot reuse a connection
+			// whose body was abandoned, so closing on its own tears the
+			// connection down and the retry below has to dial again -- on a
+			// path that exists precisely because a seek is in progress. The
+			// bodies here are short refusals; the cap is what stops a
+			// misbehaving upstream turning this into a download.
+			io.CopyN(io.Discard, resp.Body, maxDiscardedBody)
 			resp.Body.Close()
 			lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name}
 			e.links.forget(entry.PickCode, target)

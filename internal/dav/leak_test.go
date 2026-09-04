@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"runtime"
@@ -115,7 +116,41 @@ func TestCancelledRequestDoesNotPoisonSharedWork(t *testing.T) {
 // accumulates: no goroutine left behind, no descriptor, no growing cache.
 func TestNothingAccumulatesUnderChurn(t *testing.T) {
 	b := sample(t)
-	srv := newTestServer(t, b, Options{DirTTL: 50 * time.Millisecond, LinkTTL: 50 * time.Millisecond})
+	// Two accounts, handed out alternately, so the run exercises credentials
+	// being replaced as well as requests being served. A rotation builds a
+	// whole new epoch -- caches, contexts and all -- and weeks of unattended
+	// use is mostly this.
+	// Built up front, not in the loop: each fake backend runs an httptest
+	// origin whose goroutines would otherwise show up as growth that is the
+	// test's own doing.
+	fakes := []*fakeBackend{b}
+	for range 12 {
+		fakes = append(fakes, newFakeBackend(t))
+	}
+	rotations := make([]Backend, len(fakes))
+	for i, f := range fakes {
+		rotations[i] = f
+	}
+	creds := &fakeCredentials{queue: rotations}
+
+	// Every backend has to refuse at once. Failing only the first would stop
+	// working after the first rotation, when it is no longer the one in use --
+	// and the run would go quiet rather than fail.
+	refuseEverywhere := func(err error) {
+		for _, f := range fakes {
+			f.listErr.Store(&err)
+		}
+	}
+	acceptEverywhere := func() {
+		for _, f := range fakes {
+			f.listErr.Store(nil)
+		}
+	}
+	srv := newTestServer(t, b, Options{
+		Credentials: creds,
+		DirTTL:      50 * time.Millisecond,
+		LinkTTL:     50 * time.Millisecond,
+	})
 
 	settle(t)
 	goroutines, fds := runtime.NumGoroutine(), openFiles(t)
@@ -141,9 +176,28 @@ func TestNothingAccumulatesUnderChurn(t *testing.T) {
 		}
 		// A file that is not there.
 		do(t, srv, http.MethodGet, "/missing.mkv", nil).Body.Close()
+
+		// The login expires and is replaced, which retires an epoch and builds
+		// another. Everything the old one held has to go with it.
+		if round%7 == 0 {
+			// Past the TTL, so the listing is actually fetched rather than
+			// served from the cache the PROPFIND above just warmed. Without
+			// this the expiry is never met and nothing rotates.
+			time.Sleep(60 * time.Millisecond)
+			refuseEverywhere(pan115.ErrNotAuthorized)
+			do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}).Body.Close()
+			acceptEverywhere()
+		}
 	}
 
 	settle(t)
+	// The run has to have done what it claims, or the counts below measure an
+	// idle server. A vacuous soak is worse than none: it reports safety.
+	handed, rejected := creds.counts()
+	t.Logf("rotations: handed=%d rejected=%d", handed, rejected)
+	if handed < 5 || rejected < 5 {
+		t.Fatalf("credentials were handed out %d times and rejected %d; the run never rotated", handed, rejected)
+	}
 	if grew := runtime.NumGoroutine() - goroutines; grew > 4 {
 		t.Errorf("goroutines grew by %d over the run (from %d)", grew, goroutines)
 		buf := make([]byte, 1<<16)
@@ -211,4 +265,113 @@ func TestDirectoryCacheIsBoundedByEntries(t *testing.T) {
 		t.Errorf("cache holds %d entries across %d directories, over the %d cap",
 			entries, dirs, maxCachedEntries)
 	}
+}
+
+// heapAfterGC reports live heap bytes, with the garbage actually collected.
+// Two cycles: the first frees, the second measures what the first could not.
+func heapAfterGC() uint64 {
+	runtime.GC()
+	runtime.GC()
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+	return m.HeapAlloc
+}
+
+// Retiring an epoch has to release everything it held, and a context is the
+// part that will not release itself.
+//
+// Each epoch derives a context from the server's, and a derived context stays
+// registered with its parent until it is cancelled -- so an epoch that is
+// dropped without being cancelled leaves a node on a list that lives as long
+// as the process. Nothing would look wrong: the caches go, the client goes,
+// and a router picking up a new cookie every few hours quietly accumulates one
+// of these for each until it runs out of memory.
+//
+// The rotation count is far past anything real. It is chosen so that a leak of
+// a couple of hundred bytes apiece is well clear of the noise in a heap
+// measurement, which is the only signal available from outside the context
+// package.
+func TestRetiringAnEpochReleasesIt(t *testing.T) {
+	b := sample(t)
+	owner, stop := context.WithCancel(context.Background())
+	defer stop()
+
+	// A source that hands out a different client every time, which is what
+	// makes rotate actually rotate. What is behind it does not matter; the
+	// epoch lifecycle is what is under test.
+	creds := &alwaysNew{}
+	e := &epochs{
+		owner: owner,
+		creds: creds,
+		opts:  Options{DirTTL: time.Minute, LinkTTL: time.Minute},
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	_ = b
+
+	churn := func() {
+		current, err := e.get(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		fresh, err := e.rotate(context.Background(), current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Without this the loop can spin without rotating anything and the
+		// measurement below means nothing. It caught exactly that: an inert
+		// backend that was a zero-size struct, every instance of which Go
+		// allocates at the same address, so rotate decided the source had
+		// handed back what it already had.
+		if fresh == nil || fresh == current {
+			t.Fatal("rotate did not replace the epoch; the test would measure nothing")
+		}
+	}
+
+	// Warm up, so the measurement is not dominated by first-use allocation.
+	for range 100 {
+		churn()
+	}
+
+	settle(t)
+	before, goroutines, fds := heapAfterGC(), runtime.NumGoroutine(), openFiles(t)
+
+	const rotations = 20000
+	for range rotations {
+		churn()
+	}
+
+	settle(t)
+	after := heapAfterGC()
+
+	// A retained context and its parent's bookkeeping run to a couple of
+	// hundred bytes; 20000 of them is megabytes. The allowance is far above
+	// the noise and far below a leak.
+	const allowance = 1 << 20
+	if after > before+allowance {
+		t.Errorf("heap grew by %d bytes over %d rotations (from %d to %d); a retired epoch is still referenced",
+			after-before, rotations, before, after)
+	}
+	if grew := runtime.NumGoroutine() - goroutines; grew > 4 {
+		t.Errorf("goroutines grew by %d over %d rotations", grew, rotations)
+	}
+	if grew := openFiles(t) - fds; grew > 4 {
+		t.Errorf("open descriptors grew by %d over %d rotations", grew, rotations)
+	}
+}
+
+// alwaysNew is a credential source with an inexhaustible supply of distinct
+// clients, so that every rotation really replaces one.
+type alwaysNew struct{}
+
+func (*alwaysNew) Backend(context.Context) (Backend, error) { return &inertBackend{}, nil }
+func (*alwaysNew) Reject(Backend)                           {}
+
+// inertBackend carries a field so that instances have distinct addresses. A
+// zero-size struct would not: Go allocates them all at one address, and every
+// pointer to one compares equal to every other.
+type inertBackend struct{ _ byte }
+
+func (*inertBackend) List(context.Context, string) ([]pan115.Entry, error) { return nil, nil }
+func (*inertBackend) Resolve(context.Context, string) (*pan115.Target, error) {
+	return nil, pan115.ErrNotFound
 }
