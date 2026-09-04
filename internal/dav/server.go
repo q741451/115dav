@@ -2,6 +2,7 @@ package dav
 
 import (
 	"crypto/subtle"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"html"
@@ -11,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -38,6 +40,14 @@ type Options struct {
 	// set. Leaving them empty serves the mount without authentication.
 	Username, Password string
 
+	// Unavailable reports whether the backend is in a known-bad state. When
+	// it returns true every request is refused immediately, without reaching
+	// 115 or whatever is holding its credentials. Optional.
+	Unavailable func() bool
+
+	// RetryAfter is advertised alongside a 503.
+	RetryAfter time.Duration
+
 	Logger *slog.Logger
 }
 
@@ -60,7 +70,7 @@ func New(opts Options) *Server {
 
 	return &Server{
 		tree:   tree,
-		stream: newStreamer(opts.Backend, opts.LinkTTL, log),
+		stream: newStreamer(opts.Backend, opts.LinkTTL, opts.RetryAfter, log),
 		propfind: &webdav.Handler{
 			FileSystem: &fileSystem{tree: tree},
 			// Required by the handler even though locking is never exercised:
@@ -75,6 +85,15 @@ func New(opts Options) *Server {
 		opts: opts,
 		log:  log,
 	}
+}
+
+// Flush discards every cache derived from the current credentials. It is
+// called after those credentials are replaced, at which point the channel may
+// be pointing at a different 115 account whose directory ids and pick codes
+// have nothing to do with what is cached.
+func (s *Server) Flush() {
+	s.tree.Clear()
+	s.stream.links.clear()
 }
 
 // allowedMethods is what a read-only mount supports, and what OPTIONS
@@ -96,16 +115,87 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// While the backend is known to be unusable, refuse everything up front:
+	// no request to 115, none to whatever holds its credentials.
+	if s.opts.Unavailable != nil && s.opts.Unavailable() && r.Method != http.MethodOptions {
+		s.serveUnavailable(recorder)
+		return
+	}
+
 	switch r.Method {
 	case http.MethodOptions:
 		s.serveOptions(recorder)
 	case "PROPFIND":
-		s.propfind.ServeHTTP(recorder, r)
+		s.servePropfind(recorder, r)
 	case http.MethodGet, http.MethodHead:
 		s.serveContent(recorder, r)
 	default:
 		recorder.Header().Set("Allow", allowedMethods)
 		http.Error(recorder, "read-only mount", http.StatusMethodNotAllowed)
+	}
+}
+
+// servePropfind answers a listing, resolving everything the walk will read
+// before letting the WebDAV handler start writing.
+//
+// Doing it in this order is what makes an error reportable. x/net/webdav
+// discovers a listing failure halfway through the multi-status body, by which
+// point the 207 status line has gone out; worse, a failure wrapped as a
+// PathError -- which is every failure this filesystem produces -- is taken to
+// mean "this directory is unreadable, skip it", and the client is told the
+// directory is empty. An expired login would look exactly like a library that
+// had been deleted. Both resolutions below land in the cache the walk then
+// reads, so this replaces the requests it would have made rather than adding
+// to them.
+func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
+	depth := parseDepth(r.Header.Get("Depth"))
+	if depth == depthInfinite {
+		// RFC 4918 allows refusing an unbounded walk, and here it has to be
+		// refused: it would list the entire account, one rate-limited request
+		// per directory, for as long as that takes. Clients are expected to
+		// handle this and ask again with a depth.
+		s.log.Warn("refused an unbounded PROPFIND", "path", r.URL.Path, "agent", r.UserAgent())
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, xml.Header+`<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`)
+		return
+	}
+
+	// A malformed Depth is left to the handler, which rejects it with 400
+	// before writing anything.
+	if depth != depthInvalid {
+		entry, err := s.tree.Lookup(r.Context(), r.URL.Path)
+		if err != nil {
+			s.replyLookupError(w, r, err)
+			return
+		}
+		if depth == 1 && entry.IsDir {
+			if _, err := s.tree.Children(r.Context(), entry.ID); err != nil {
+				s.replyLookupError(w, r, err)
+				return
+			}
+		}
+	}
+	s.propfind.ServeHTTP(w, r)
+}
+
+// Depth values, matching what x/net/webdav accepts. A missing header means
+// infinity, per RFC 4918.
+const (
+	depthInfinite = -1
+	depthInvalid  = -2
+)
+
+func parseDepth(value string) int {
+	switch value {
+	case "0":
+		return 0
+	case "1":
+		return 1
+	case "", "infinity":
+		return depthInfinite
+	default:
+		return depthInvalid
 	}
 }
 
@@ -137,8 +227,24 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (s *Server) serveUnavailable(w http.ResponseWriter) {
+	writeUnavailable(w, s.opts.RetryAfter)
+}
+
+// writeUnavailable answers 503 with a hint about when to come back. Anything
+// but an empty success will do here; see ErrUnavailable for why an empty
+// listing would be the wrong answer.
+func writeUnavailable(w http.ResponseWriter, retryAfter time.Duration) {
+	if retryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(retryAfter.Seconds())))
+	}
+	http.Error(w, "115 credentials are being refreshed", http.StatusServiceUnavailable)
+}
+
 func (s *Server) replyLookupError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
+	case errors.Is(err, ErrUnavailable):
+		s.serveUnavailable(w)
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, pan115.ErrNotFound):
 		http.NotFound(w, r)
 	case errors.Is(err, pan115.ErrNotAuthorized):

@@ -21,8 +21,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/q741451/115dav/internal/cookiesync"
 	"github.com/q741451/115dav/internal/dav"
 	"github.com/q741451/115dav/internal/pan115"
+	"github.com/q741451/115dav/internal/session"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=...".
@@ -43,6 +45,15 @@ type options struct {
 	userAgent   string
 	verbose     bool
 	showVersion bool
+
+	// Subscription mode: read the cookie from a cookie-sync server instead of
+	// being given one. Mutually exclusive with the options above.
+	cookieServer  string
+	cookieChannel string
+	cookieKey     string
+	cookieKeyFile string
+	cookieDomain  string
+	cookieRetry   time.Duration
 }
 
 func main() {
@@ -65,39 +76,52 @@ func run() error {
 	}
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 
-	cookie, err := readCookie(opts)
-	if err != nil {
+	if err := checkModes(opts); err != nil {
 		return err
 	}
 
-	client, err := pan115.New(pan115.Config{
-		Cookie:            cookie,
-		UserAgent:         opts.userAgent,
-		RequestsPerSecond: opts.rate,
-		PageSize:          opts.pageSize,
-	})
+	build := func(cookie string) (*pan115.Client, error) {
+		return pan115.New(pan115.Config{
+			Cookie:            cookie,
+			UserAgent:         opts.userAgent,
+			RequestsPerSecond: opts.rate,
+			PageSize:          opts.pageSize,
+		})
+	}
+
+	var (
+		backend     dav.Backend
+		unavailable func() bool
+		onServer    func(*dav.Server)
+		err         error
+	)
+	if opts.cookieServer != "" {
+		var synced *session.Session
+		if synced, err = openSynced(opts, build, log); err == nil {
+			backend, unavailable = synced, synced.Blocked
+			onServer = func(s *dav.Server) { synced.OnRefresh(s.Flush) }
+		}
+	} else {
+		backend, err = openStatic(opts, build, log)
+	}
 	if err != nil {
 		return err
 	}
-
-	// Fail loudly at startup rather than at the first PROPFIND: a bad cookie
-	// is the overwhelmingly common setup mistake.
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	if err := client.CheckAccess(ctx); err != nil {
-		return fmt.Errorf("cannot reach 115: %w", err)
-	}
-	log.Info("115 session accepted", "root", opts.root)
 
 	handler := dav.New(dav.Options{
-		Backend:  client,
-		RootID:   opts.root,
-		DirTTL:   opts.dirTTL,
-		LinkTTL:  opts.linkTTL,
-		Username: opts.username,
-		Password: opts.password,
-		Logger:   log,
+		Backend:     backend,
+		RootID:      opts.root,
+		DirTTL:      opts.dirTTL,
+		LinkTTL:     opts.linkTTL,
+		Username:    opts.username,
+		Password:    opts.password,
+		Unavailable: unavailable,
+		RetryAfter:  opts.cookieRetry,
+		Logger:      log,
 	})
+	if onServer != nil {
+		onServer(handler)
+	}
 
 	server := &http.Server{
 		Addr:    opts.listen,
@@ -153,6 +177,115 @@ func serve(server *http.Server, log *slog.Logger, opts options) error {
 	return nil
 }
 
+// openStatic builds a client from a cookie given on the command line, in a
+// file, or in the environment.
+//
+// The cookie is checked against 115 before serving starts: it cannot be
+// replaced without a restart, so a bad one is worth failing on immediately.
+func openStatic(opts options, build func(string) (*pan115.Client, error), log *slog.Logger) (dav.Backend, error) {
+	cookie, err := readCookie(opts)
+	if err != nil {
+		return nil, err
+	}
+	client, err := build(cookie)
+	if err != nil {
+		return nil, err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := client.CheckAccess(ctx); err != nil {
+		return nil, fmt.Errorf("cannot reach 115: %w", err)
+	}
+	log.Info("115 session accepted", "root", opts.root)
+	return client, nil
+}
+
+// openSynced builds a backend that reads its cookie from a cookie-sync server
+// and re-reads it whenever 115 stops accepting it.
+//
+// Unlike the static mode, the cookie is not checked against 115 here. A stale
+// one on the server is the ordinary state this mode exists to recover from,
+// and it costs nothing to let the first real request discover it.
+func openSynced(opts options, build func(string) (*pan115.Client, error), log *slog.Logger) (*session.Session, error) {
+	key, err := readCookieKey(opts)
+	if err != nil {
+		return nil, err
+	}
+	source, err := cookiesync.New(cookiesync.Config{
+		Server:  opts.cookieServer,
+		Channel: opts.cookieChannel,
+		Key:     key,
+		Domain:  opts.cookieDomain,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if source.Insecure() {
+		log.Warn("the cookie server is plain HTTP, so the channel key and the 115 cookies both cross the network in the clear",
+			"server", source.Server())
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Read once now, so that a wrong channel name, key or domain is reported
+	// at startup rather than at the first PROPFIND.
+	cookie, err := source.Fetch(ctx)
+	switch {
+	case errors.Is(err, cookiesync.ErrRejected):
+		return nil, err
+	case errors.Is(err, cookiesync.ErrNoDomain):
+		if names, listErr := source.Domains(ctx); listErr == nil && len(names) > 0 {
+			return nil, fmt.Errorf("%w; this channel holds: %s", err, strings.Join(names, ", "))
+		}
+		return nil, err
+	case err != nil:
+		// Transient, and the router may simply not be online yet. Carry on
+		// with nothing; the first request will fetch.
+		log.Warn("could not read the cookie server at startup, will try again on the first request", "err", err)
+		cookie = ""
+	default:
+		log.Info("read cookies from the cookie server",
+			"server", source.Server(), "channel", opts.cookieChannel, "domain", opts.cookieDomain)
+	}
+
+	if cookie != "" {
+		if _, err := build(cookie); err != nil {
+			// An incomplete set from the browser extension. The next upload
+			// fixes it, so this is not worth refusing to start over.
+			log.Warn("the cookies on the server are not usable yet", "err", err)
+			cookie = ""
+		}
+	}
+
+	return session.New(session.Options{
+		Source:   source,
+		Build:    build,
+		Cookie:   cookie,
+		Blackout: opts.cookieRetry,
+		Logger:   log,
+	})
+}
+
+// readCookieKey takes the channel key from whichever source was configured.
+func readCookieKey(opts options) (string, error) {
+	if opts.cookieKeyFile != "" {
+		raw, err := os.ReadFile(opts.cookieKeyFile)
+		if err != nil {
+			return "", fmt.Errorf("read cookie key file: %w", err)
+		}
+		return strings.TrimSpace(string(raw)), nil
+	}
+	if opts.cookieKey != "" {
+		return opts.cookieKey, nil
+	}
+	if env := os.Getenv("PAN115_COOKIE_KEY"); env != "" {
+		return env, nil
+	}
+	return "", errors.New("no channel key given: pass -cookie-key, -cookie-key-file, or set PAN115_COOKIE_KEY")
+}
+
 func mountHints(addr net.Addr, opts options) []string {
 	host := "127.0.0.1"
 	if tcp, ok := addr.(*net.TCPAddr); ok {
@@ -184,6 +317,16 @@ func parseFlags() options {
 	flag.BoolVar(&opts.verbose, "v", false, "log every request")
 	flag.BoolVar(&opts.showVersion, "version", false, "print the version and exit")
 
+	flag.StringVar(&opts.cookieServer, "cookie-server", os.Getenv("PAN115_COOKIE_SERVER"),
+		"read the cookie from a cookie-sync server instead, e.g. https://sync.example.com")
+	flag.StringVar(&opts.cookieChannel, "cookie-channel", os.Getenv("PAN115_COOKIE_CHANNEL"), "channel name on that server")
+	flag.StringVar(&opts.cookieKey, "cookie-key", "", "channel key, or set PAN115_COOKIE_KEY")
+	flag.StringVar(&opts.cookieKeyFile, "cookie-key-file", "", "read the channel key from this file instead")
+	flag.StringVar(&opts.cookieDomain, "cookie-domain", cmpOr(os.Getenv("PAN115_COOKIE_DOMAIN"), "115.com"),
+		"which domain to read inside the channel")
+	flag.DurationVar(&opts.cookieRetry, "cookie-retry", session.DefaultBlackout,
+		"how long to answer 503 after the cookie server fails to supply working cookies")
+
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		fmt.Fprintf(out, "115dav %s serves a 115 account as a read-only WebDAV mount.\n\n", version)
@@ -192,6 +335,40 @@ func parseFlags() options {
 	}
 	flag.Parse()
 	return opts
+}
+
+func cmpOr(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+// checkModes rejects a configuration that names both cookie sources. They
+// behave differently on failure, so silently preferring one would make the
+// other's semantics a surprise.
+func checkModes(opts options) error {
+	if opts.cookieServer == "" {
+		return nil
+	}
+	var given []string
+	if opts.cookie != "" {
+		given = append(given, "-cookie")
+	}
+	if opts.cookieFile != "" {
+		given = append(given, "-cookie-file")
+	}
+	if os.Getenv("PAN115_COOKIE") != "" {
+		given = append(given, "PAN115_COOKIE")
+	}
+	if len(given) > 0 {
+		return fmt.Errorf("-cookie-server cannot be combined with %s: choose one source for the cookie",
+			strings.Join(given, " or "))
+	}
+	if opts.cookieChannel == "" {
+		return errors.New("-cookie-server needs -cookie-channel")
+	}
+	return nil
 }
 
 // readCookie takes the cookie from whichever source was configured, preferring

@@ -3,6 +3,7 @@ package dav
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -31,6 +32,7 @@ type fakeBackend struct {
 	// backend has handed out so far.
 	generation atomic.Int64
 
+	listErr      atomic.Pointer[error]
 	listCalls    atomic.Int64
 	resolveCalls atomic.Int64
 	fetches      atomic.Int64
@@ -77,12 +79,19 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 func (b *fakeBackend) List(_ context.Context, id string) ([]pan115.Entry, error) {
 	b.listCalls.Add(1)
+	if err := b.listErr.Load(); err != nil {
+		return nil, *err
+	}
 	entries, ok := b.dirs[id]
 	if !ok {
 		return nil, pan115.ErrNotFound
 	}
 	return entries, nil
 }
+
+// failListings makes every subsequent listing fail, which is how an expired
+// login or a dead network reaches the WebDAV layer.
+func (b *fakeBackend) failListings(err error) { b.listErr.Store(&err) }
 
 func (b *fakeBackend) Resolve(_ context.Context, pickCode string) (*pan115.Target, error) {
 	b.resolveCalls.Add(1)
@@ -455,4 +464,152 @@ func (b *safeBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// A failed listing must never reach the client as an empty directory.
+//
+// x/net/webdav writes the 207 status line before it walks, and treats a
+// PathError from Readdir as "skip this directory", so without a pre-flight the
+// reply is a well-formed multi-status containing nothing -- which a player
+// reads as a library that has been emptied.
+func TestPropfindDoesNotReportAnEmptyDirectoryOnFailure(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err        error
+		wantStatus int
+	}{
+		"credentials being refreshed": {ErrUnavailable, http.StatusServiceUnavailable},
+		"backend broken":              {errors.New("connection reset"), http.StatusBadGateway},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := sample(t)
+			srv := newTestServer(t, b, Options{RetryAfter: 30 * time.Second})
+			b.failListings(tc.err)
+
+			resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"})
+			if resp.StatusCode != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body:\n%s", resp.StatusCode, tc.wantStatus, body(t, resp))
+			}
+			if strings.Contains(body(t, resp), "<D:multistatus") {
+				t.Error("answered with a multi-status; a partial listing is worse than an error")
+			}
+		})
+	}
+}
+
+// Retry-After tells a player when to come back rather than leaving it to
+// hammer the mount.
+func TestUnavailableCarriesRetryAfter(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{RetryAfter: 30 * time.Second})
+	b.failListings(ErrUnavailable)
+
+	resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"})
+	if got := resp.Header.Get("Retry-After"); got != "30" {
+		t.Errorf("Retry-After = %q, want 30", got)
+	}
+}
+
+// Depth: 0 asks about the directory itself, so a broken listing is beside the
+// point and must not turn into an error.
+func TestPropfindDepthZeroNeedsNoListing(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{})
+	b.failListings(ErrUnavailable)
+
+	resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "0"})
+	if resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("status = %d, want 207", resp.StatusCode)
+	}
+	if n := b.listCalls.Load(); n != 0 {
+		t.Errorf("listed %d times for a Depth: 0 request, want 0", n)
+	}
+}
+
+// An unbounded walk would enumerate the whole account one rate-limited request
+// at a time, so it is refused the way RFC 4918 provides for.
+func TestUnboundedPropfindIsRefused(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{})
+
+	for _, depth := range []string{"infinity", ""} {
+		headers := map[string]string{"Depth": depth}
+		if depth == "" {
+			headers = nil // absent means infinity
+		}
+		resp := do(t, srv, "PROPFIND", "/", headers)
+		if resp.StatusCode != http.StatusForbidden {
+			t.Errorf("Depth %q = %d, want 403", depth, resp.StatusCode)
+		}
+		if got := body(t, resp); !strings.Contains(got, "propfind-finite-depth") {
+			t.Errorf("Depth %q body does not name the precondition:\n%s", depth, got)
+		}
+	}
+	if n := b.listCalls.Load(); n != 0 {
+		t.Errorf("listed %d times while refusing, want 0", n)
+	}
+}
+
+// While the backend is known to be unusable, nothing is asked of it at all.
+func TestUnavailableShortCircuitsEverything(t *testing.T) {
+	b := sample(t)
+	down := true
+	srv := newTestServer(t, b, Options{
+		Unavailable: func() bool { return down },
+		RetryAfter:  15 * time.Second,
+	})
+
+	for _, tc := range []struct{ method, path string }{
+		{"PROPFIND", "/"}, {http.MethodGet, "/film.mkv"}, {http.MethodHead, "/film.mkv"}, {http.MethodGet, "/"},
+	} {
+		resp := do(t, srv, tc.method, tc.path, map[string]string{"Depth": "1"})
+		if resp.StatusCode != http.StatusServiceUnavailable {
+			t.Errorf("%s %s = %d, want 503", tc.method, tc.path, resp.StatusCode)
+		}
+	}
+	if n := b.listCalls.Load() + b.resolveCalls.Load(); n != 0 {
+		t.Errorf("made %d backend calls while unavailable, want 0", n)
+	}
+
+	// OPTIONS still answers, so a client can tell the mount apart from a dead
+	// port and knows to come back.
+	if resp := do(t, srv, http.MethodOptions, "/", nil); resp.StatusCode != http.StatusOK {
+		t.Errorf("OPTIONS = %d, want 200 even while unavailable", resp.StatusCode)
+	}
+
+	down = false
+	if resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
+		t.Errorf("status = %d after recovery, want 207", resp.StatusCode)
+	}
+}
+
+// Flush is what makes a credential swap safe: nothing resolved under the old
+// identity may be served after it.
+func TestFlushDropsEveryCache(t *testing.T) {
+	b := sample(t)
+	server := New(Options{
+		Backend: b, DirTTL: time.Hour, LinkTTL: time.Hour,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	srv := httptest.NewServer(server)
+	t.Cleanup(srv.Close)
+
+	if resp := do(t, srv, http.MethodGet, "/film.mkv", nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	listed, resolved := b.listCalls.Load(), b.resolveCalls.Load()
+
+	// Warm: neither the listing nor the link is fetched again.
+	do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if b.listCalls.Load() != listed || b.resolveCalls.Load() != resolved {
+		t.Fatal("a warm cache still went to the backend")
+	}
+
+	server.Flush()
+	do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if b.listCalls.Load() <= listed {
+		t.Error("the directory cache survived a flush")
+	}
+	if b.resolveCalls.Load() <= resolved {
+		t.Error("the link cache survived a flush")
+	}
 }

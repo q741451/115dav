@@ -108,6 +108,14 @@ func (c *linkCache) sweepLocked() {
 	}
 }
 
+// clear empties the cache, for when the credentials behind every cached link
+// have been replaced.
+func (c *linkCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	clear(c.items)
+}
+
 func (c *linkCache) forget(pickCode string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -120,16 +128,17 @@ func (c *linkCache) forget(pickCode string) {
 // User-Agent and session that requested it, which a player would not reproduce
 // if it were sent there directly.
 type streamer struct {
-	links  *linkCache
-	client *http.Client
-	log    *slog.Logger
-	bufs   sync.Pool
+	links      *linkCache
+	client     *http.Client
+	log        *slog.Logger
+	retryAfter time.Duration
+	bufs       sync.Pool
 }
 
 // streamBufferSize trades memory for syscalls on large sequential reads.
 const streamBufferSize = 256 << 10
 
-func newStreamer(backend Backend, linkTTL time.Duration, log *slog.Logger) *streamer {
+func newStreamer(backend Backend, linkTTL, retryAfter time.Duration, log *slog.Logger) *streamer {
 	return &streamer{
 		links: newLinkCache(backend, linkTTL),
 		// No Client.Timeout: a feature-length file legitimately streams for
@@ -148,8 +157,9 @@ func newStreamer(backend Backend, linkTTL time.Duration, log *slog.Logger) *stre
 				ForceAttemptHTTP2:     true,
 			},
 		},
-		log:  log,
-		bufs: sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
+		log:        log,
+		retryAfter: retryAfter,
+		bufs:       sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
 	}
 }
 
@@ -187,9 +197,12 @@ func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115
 	client := &clientWriter{Writer: w}
 	switch _, err := io.CopyBuffer(client, resp.Body, *buf); {
 	case err == nil:
-	case client.err != nil:
+	case client.err != nil, r.Context().Err() != nil:
 		// Players close connections constantly: after probing a container,
-		// on every seek, and when playback stops.
+		// on every seek, and when playback stops. Which half of the copy
+		// notices first is a race -- the write to the client fails, or the
+		// cancelled request context aborts the read from the CDN -- so both
+		// count as the player leaving.
 		s.log.Debug("player closed the stream", "file", entry.Name, "err", err)
 	default:
 		// The status line is already out; all that is left is to record it.
@@ -263,17 +276,19 @@ func (s *streamer) fail(w http.ResponseWriter, r *http.Request, entry pan115.Ent
 	if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 		return
 	}
-	s.log.Error("cannot stream file", "file", entry.Name, "err", err)
+	if !errors.Is(err, ErrUnavailable) {
+		s.log.Error("cannot stream file", "file", entry.Name, "err", err)
+	}
 
-	status := http.StatusBadGateway
 	var notDownloadable *pan115.ErrNotDownloadable
 	switch {
+	case errors.Is(err, ErrUnavailable):
+		writeUnavailable(w, s.retryAfter)
 	case errors.As(err, &notDownloadable):
-		status = http.StatusForbidden
-	case errors.Is(err, pan115.ErrNotAuthorized):
-		status = http.StatusBadGateway
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
+	default:
+		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
 	}
-	http.Error(w, http.StatusText(status), status)
 }
 
 type upstreamError struct {

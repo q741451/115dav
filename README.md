@@ -29,6 +29,38 @@ PAN115_COOKIE='UID=...; CID=...; SEID=...' 115dav
 
 启动时会先验证 cookie，不通就直接退出，不会等到播放器连上才发现。
 
+## 无人值守：从 cookie 服务器订阅
+
+挂在路由器上长期跑的话，cookie 过期就得上去重启一次。改成从 [cookie-sync](https://github.com/q741451/cookie-sync) 服务器读，浏览器插件在任何一台机器上重新上传，这边下一个请求就自己捡起来，不用重启：
+
+```
+115dav -cookie-server https://sync.example.com \
+       -cookie-channel 我的频道 -cookie-key-file /etc/115dav.key
+```
+
+给只读 key 就够，它只会读，不会往上写。
+
+和 `-cookie` / `-cookie-file` / `PAN115_COOKIE` 二选一，同时给会直接报错——两种模式出错时的行为不一样，让它自己猜不如说清楚。
+
+行为：
+
+- 启动只从服务器取一次，**不验 115**。服务器上放着过期 cookie 本来就是这个模式要处理的常态，等播放器自己发现就行。频道名、key、domain 写错会当场退出，并告诉你这个频道里实际有哪些 domain。
+- 服务器连不上不影响启动（路由器开机时网络往往还没好），只 warn 一句，第一个请求再取。
+- 115 说 cookie 过期 → 回服务器重取一次 → 拿到新的就换上继续；服务器上还是刚被拒的那份就不去试了。
+- 换 cookie 会清掉所有缓存（目录、直链）。下次可能整个换了一个账号，旧的目录 id 和提取码没有任何意义。
+- 取不到可用 cookie 的这段时间一律回 **503 + `Retry-After`**，默认 30 秒内不再碰 115 也不碰 cookie 服务器（`-cookie-retry` 可调）。回 503 而不是空目录是有意的：播放器看到空目录会以为片库被删了。
+- 每次取都重新解析域名，服务器换 IP 不用重启。
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-cookie-server` | — | cookie-sync 服务器地址，也可用 `PAN115_COOKIE_SERVER` |
+| `-cookie-channel` | — | 频道名，也可用 `PAN115_COOKIE_CHANNEL` |
+| `-cookie-key` / `-cookie-key-file` | — | 频道 key，也可用 `PAN115_COOKIE_KEY` |
+| `-cookie-domain` | `115.com` | 读频道里的哪个 domain |
+| `-cookie-retry` | `30s` | 取不到可用 cookie 后，多久之内直接回 503 |
+
+用 `http://` 而不是 `https://` 的话，key 和 115 cookie 都是明文过网络，启动时会警告一次。
+
 ## 参数
 
 | 参数 | 默认 | 说明 |
@@ -50,6 +82,8 @@ PAN115_COOKIE='UID=...; CID=...; SEID=...' 115dav
 - **只读。** 所有写方法一律 405，底层也没有实现任何 115 写接口。
 - **直链过期自动重取**，播放不中断。
 - **同目录重名文件**会自动显示成 `片子 (2).mkv`，保证每个都能访问。
+- **列目录失败就报错，不会返回空目录。** 上游出错时返回半截 207 会被播放器读成「片库空了」，所以宁可给 503 / 502。
+- **`Depth: infinity` 的 PROPFIND 一律 403**（`propfind-finite-depth`）。整个账号递归列一遍要按每秒两个请求慢慢爬几个小时，正常客户端都用 `Depth: 1`。
 
 ## 构建
 

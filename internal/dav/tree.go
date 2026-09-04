@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"path"
@@ -14,9 +15,18 @@ import (
 	"github.com/q741451/115dav/internal/pan115"
 )
 
+// ErrUnavailable means the backend cannot serve right now but may later --
+// the credentials it uses are being replaced, say.
+//
+// It is answered with 503 rather than an empty listing on purpose. To a media
+// client an empty directory is a fact: it will conclude the library is gone
+// and discard what it knows about it. A 503 says "ask again", which is what
+// is actually true.
+var ErrUnavailable = errors.New("115 is temporarily unavailable")
+
 // Backend is the slice of 115 this package needs. The concrete implementation
-// is *pan115.Client; the interface exists so the WebDAV layer can be tested
-// without talking to 115.
+// is *pan115.Client, or a wrapper that keeps its credentials current; the
+// interface exists so the WebDAV layer can be tested without talking to 115.
 type Backend interface {
 	List(ctx context.Context, id string) ([]pan115.Entry, error)
 	Resolve(ctx context.Context, pickCode string) (*pan115.Target, error)
@@ -150,6 +160,14 @@ func (t *Tree) sweepLocked() {
 	if len(t.dirs) >= maxCachedDirs {
 		clear(t.dirs)
 	}
+}
+
+// Clear empties the cache. Used when the credentials change: the listings
+// were made under an identity that may not even be the same account.
+func (t *Tree) Clear() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	clear(t.dirs)
 }
 
 // Forget drops any cached listing for a directory.
