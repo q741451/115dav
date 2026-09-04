@@ -3,10 +3,14 @@
 //
 // It exists so that an unattended process -- on a router, say -- survives a
 // login expiring: the cookies are replaced remotely, and the next request
-// picks them up. Switching is not seamless and does not try to be. A refresh
-// throws away the old client and every cache built with it, because the
-// channel may by then hold a different 115 account entirely, whose directory
-// ids and pick codes have nothing to do with the ones already cached.
+// picks them up. Switching is not seamless and does not try to be. What is
+// built on a client is discarded with it, because the channel may by then hold
+// a different 115 account entirely, whose directory ids and pick codes have
+// nothing to do with the ones already cached.
+//
+// Discarding it is not this package's job, and it does not know how: it hands
+// out a client and is told when one stops working. Whoever asked for it owns
+// what it derived.
 package session
 
 import (
@@ -20,7 +24,6 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/q741451/115dav/internal/cookiesync"
-	"github.com/q741451/115dav/internal/dav"
 	"github.com/q741451/115dav/internal/pan115"
 )
 
@@ -58,23 +61,26 @@ const fetchTimeout = 30 * time.Second
 // in again and re-uploading is not racing a stream of retries.
 const DefaultBlackout = 30 * time.Second
 
-// Session is a dav.Backend that refreshes its own credentials.
+// ErrUnavailable means no usable cookies are to be had right now, but may be
+// later -- someone has to upload a fresh login.
+var ErrUnavailable = errors.New("115 credentials are being refreshed")
+
+// Session hands out a 115 client and replaces it when 115 stops accepting it.
 type Session struct {
 	opts   Options
 	client atomic.Pointer[pan115.Client]
 	cookie atomic.Pointer[string]
 
-	group singleflight.Group
+	// refused is the cookie 115 last rejected. Fetching it again would only
+	// earn another rejection, so seeing it come back from the server means
+	// nobody has uploaded a new login yet.
+	refused atomic.Pointer[string]
 
-	// flush is wired after construction: it points at the server built on top
-	// of this session, which cannot exist until this does.
-	flush atomic.Pointer[func()]
+	group singleflight.Group
 
 	mu           sync.Mutex
 	blockedUntil time.Time
 }
-
-var _ dav.Backend = (*Session)(nil)
 
 // New returns a Session. A non-empty Options.Cookie is adopted immediately;
 // otherwise the first request fetches one.
@@ -95,85 +101,66 @@ func New(opts Options) (*Session, error) {
 		if err != nil {
 			return nil, err
 		}
-		// Stored rather than adopted: at construction there is nothing built
-		// on the old credentials, so there is nothing to discard.
 		s.client.Store(client)
 		s.cookie.Store(&opts.Cookie)
 	}
 	return s, nil
 }
 
-// OnRefresh registers what to discard when the credentials are replaced. It
-// is set after construction because the caches in question belong to the
-// server built on top of this session.
-func (s *Session) OnRefresh(flush func()) {
-	s.flush.Store(&flush)
-}
-
-func (s *Session) List(ctx context.Context, id string) ([]pan115.Entry, error) {
-	return withRefresh(s, ctx, func(c *pan115.Client) ([]pan115.Entry, error) {
-		return c.List(ctx, id)
-	})
-}
-
-func (s *Session) Resolve(ctx context.Context, pickCode string) (*pan115.Target, error) {
-	return withRefresh(s, ctx, func(c *pan115.Client) (*pan115.Target, error) {
-		return c.Resolve(ctx, pickCode)
-	})
-}
-
-// withRefresh runs op, and if 115 rejects the cookies, fetches once more and
-// runs it again. A method cannot take a type parameter, hence the free
-// function.
-func withRefresh[T any](s *Session, ctx context.Context, op func(*pan115.Client) (T, error)) (T, error) {
-	var zero T
-
+// Client returns the client to use now, fetching cookies if it has none.
+//
+// The error is ErrUnavailable whenever the situation is one a person can fix
+// by logging in again, which is nearly all of them: the caller answers 503 and
+// says when to come back, rather than reporting a failure that looks permanent.
+func (s *Session) Client(ctx context.Context) (*pan115.Client, error) {
 	if s.blocked() {
-		return zero, dav.ErrUnavailable
+		return nil, ErrUnavailable
 	}
-
+	if client := s.client.Load(); client != nil {
+		return client, nil
+	}
+	if err := s.refresh(ctx); err != nil {
+		return nil, err
+	}
 	client := s.client.Load()
 	if client == nil {
-		// Nothing yet: the startup fetch failed, or there never was one.
-		if err := s.refresh(ctx, ""); err != nil {
-			return zero, err
-		}
-		if client = s.client.Load(); client == nil {
-			// Belt and braces: a refresh that reports success has stored a
-			// client, but this is a long-lived process on an unattended box
-			// and a nil dereference here would be a poor way to find out
-			// otherwise.
-			return zero, dav.ErrUnavailable
-		}
+		// Belt and braces: a refresh that reports success has stored a client,
+		// but this is a long-lived process on an unattended box and a nil
+		// dereference here would be a poor way to find out otherwise.
+		return nil, ErrUnavailable
 	}
-
-	result, err := op(client)
-	if !errors.Is(err, pan115.ErrNotAuthorized) {
-		return result, err
-	}
-
-	// 115 no longer accepts what we have. Whatever the channel holds now is
-	// the only thing that can help.
-	s.opts.Logger.Info("115 rejected the current cookies, re-reading them from the cookie server")
-	if err := s.refresh(ctx, s.currentCookie()); err != nil {
-		return zero, err
-	}
-
-	result, err = op(s.client.Load())
-	if errors.Is(err, pan115.ErrNotAuthorized) {
-		s.block("the cookies on the server are rejected by 115 as well; update them from the browser")
-		return zero, dav.ErrUnavailable
-	}
-	return result, err
+	return client, nil
 }
 
-// refresh reads the channel and adopts what it finds. stale is the cookie
-// already known not to work; fetching it again would be pointless.
-func (s *Session) refresh(ctx context.Context, stale string) error {
+// Reject reports that 115 refused this client's cookies, so that the next call
+// to Client fetches again.
+//
+// It takes any rather than *pan115.Client so that this package need not know
+// the interface its caller passes clients around as. A value that is not the
+// one currently held is ignored, which is what makes concurrent reports of the
+// same expiry safe: several requests notice one dead login at once, and only
+// the first of them discards anything. A straggler arriving after a working
+// client has been adopted cannot throw it away.
+func (s *Session) Reject(rejected any) {
+	client, ok := rejected.(*pan115.Client)
+	if !ok || client == nil {
+		return
+	}
+	if !s.client.CompareAndSwap(client, nil) {
+		return
+	}
+	if cookie := s.cookie.Load(); cookie != nil {
+		s.refused.Store(cookie)
+	}
+	s.opts.Logger.Info("115 rejected the current cookies, re-reading them from the cookie server")
+}
+
+// refresh reads the channel and adopts what it finds.
+func (s *Session) refresh(ctx context.Context) error {
 	_, err, _ := s.group.Do("refresh", func() (any, error) {
 		// A request that queued behind another one's refresh may find the job
 		// already done.
-		if current := s.currentCookie(); current != "" && current != stale {
+		if s.client.Load() != nil {
 			return nil, nil
 		}
 
@@ -189,19 +176,19 @@ func (s *Session) refresh(ctx context.Context, stale string) error {
 			// not fatal: this process is expected to outlive such mistakes.
 			s.opts.Logger.Error("cookie server will not serve this channel", "err", err)
 			s.block("the cookie server rejected the channel or domain")
-			return nil, dav.ErrUnavailable
+			return nil, ErrUnavailable
 		case err != nil:
 			s.opts.Logger.Warn("cannot reach the cookie server", "err", err)
 			s.block("the cookie server is unreachable")
-			return nil, dav.ErrUnavailable
+			return nil, ErrUnavailable
 		}
 
-		if cookie == stale {
+		if refused := s.refused.Load(); refused != nil && cookie == *refused {
 			// Nobody has uploaded a new login yet. Trying it against 115 would
 			// only earn another rejection.
 			s.opts.Logger.Warn("the cookie server still holds the cookies 115 just rejected")
 			s.block("waiting for new cookies to be uploaded")
-			return nil, dav.ErrUnavailable
+			return nil, ErrUnavailable
 		}
 
 		client, err := s.opts.Build(cookie)
@@ -210,31 +197,16 @@ func (s *Session) refresh(ctx context.Context, stale string) error {
 			// upload fixes it, so treat it like an expired login.
 			s.opts.Logger.Warn("the cookies from the server are not usable", "err", err)
 			s.block("the cookies on the server are incomplete")
-			return nil, dav.ErrUnavailable
+			return nil, ErrUnavailable
 		}
 
-		s.adopt(client, cookie)
+		s.client.Store(client)
+		s.cookie.Store(&cookie)
+		s.unblock()
 		s.opts.Logger.Info("adopted new cookies from the cookie server")
 		return nil, nil
 	})
 	return err
-}
-
-// adopt installs a client and drops everything built with the previous one.
-func (s *Session) adopt(client *pan115.Client, cookie string) {
-	s.client.Store(client)
-	s.cookie.Store(&cookie)
-	s.unblock()
-	if flush := s.flush.Load(); flush != nil {
-		(*flush)()
-	}
-}
-
-func (s *Session) currentCookie() string {
-	if cookie := s.cookie.Load(); cookie != nil {
-		return *cookie
-	}
-	return ""
 }
 
 // block starts a quiet period. Requests during it are refused without
@@ -262,7 +234,3 @@ func (s *Session) blocked() bool {
 	defer s.mu.Unlock()
 	return time.Now().Before(s.blockedUntil)
 }
-
-// Blocked reports whether requests are currently being refused, so the server
-// can answer without entering the WebDAV machinery at all.
-func (s *Session) Blocked() bool { return s.blocked() }

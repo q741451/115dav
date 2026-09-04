@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,6 +22,10 @@ import (
 // the TTL is only an optimisation: expiry is ultimately detected by the CDN
 // refusing a request, which invalidates the entry and forces a fresh resolve.
 type linkCache struct {
+	// owner bounds a resolve, for the same reason Tree has one: the URL is
+	// shared, so it belongs to the credentials it was fetched with rather than
+	// to the request that happened to ask first.
+	owner   context.Context
 	backend Backend
 	ttl     time.Duration
 
@@ -45,8 +48,8 @@ const maxCachedLinks = 2048
 // resolveTimeout bounds a resolve that no longer has a caller waiting for it.
 const resolveTimeout = time.Minute
 
-func newLinkCache(backend Backend, ttl time.Duration) *linkCache {
-	return &linkCache{backend: backend, ttl: ttl, items: map[string]cachedLink{}}
+func newLinkCache(owner context.Context, backend Backend, ttl time.Duration) *linkCache {
+	return &linkCache{owner: owner, backend: backend, ttl: ttl, items: map[string]cachedLink{}}
 }
 
 func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, error) {
@@ -62,7 +65,7 @@ func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, e
 		// Detached from the caller for the same reason as a listing: the
 		// resolve is shared, and the request that started it may hang up
 		// while the others are still waiting on it.
-		fetch, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
+		fetch, cancel := context.WithTimeout(c.owner, resolveTimeout)
 		defer cancel()
 
 		target, err := c.backend.Resolve(fetch, pickCode)
@@ -118,18 +121,20 @@ func (c *linkCache) sweepLocked() {
 	}
 }
 
-// clear empties the cache, for when the credentials behind every cached link
-// have been replaced.
-func (c *linkCache) clear() {
+// forget drops a link, but only if the cache still holds the one that failed.
+//
+// The comparison is what stops a slow request from undoing a fast one. Several
+// range requests on the same file are rejected at once when a URL expires;
+// each re-resolves and stores, and without this check a straggler's forget
+// would delete the good link a neighbour had just fetched, sending everyone
+// back to the download endpoint -- which is rate limited to two calls a second
+// and shared with every directory listing.
+func (c *linkCache) forget(pickCode string, failed *pan115.Target) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	clear(c.items)
-}
-
-func (c *linkCache) forget(pickCode string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.items, pickCode)
+	if item, ok := c.items[pickCode]; ok && item.target == failed {
+		delete(c.items, pickCode)
+	}
 }
 
 // streamer proxies file bytes from the 115 CDN to the WebDAV client.
@@ -137,20 +142,21 @@ func (c *linkCache) forget(pickCode string) {
 // Proxying rather than redirecting is deliberate: a CDN URL is tied to the
 // User-Agent and session that requested it, which a player would not reproduce
 // if it were sent there directly.
+// The link cache is not here: it is derived from credentials and belongs to
+// an epoch. What this holds instead lasts as long as the process, because none
+// of it carries any 115 identity -- the cookies ride on each request, copied
+// from the Target that was resolved for it.
 type streamer struct {
-	links      *linkCache
-	client     *http.Client
-	log        *slog.Logger
-	retryAfter time.Duration
-	bufs       sync.Pool
+	client *http.Client
+	log    *slog.Logger
+	bufs   sync.Pool
 }
 
 // streamBufferSize trades memory for syscalls on large sequential reads.
 const streamBufferSize = 256 << 10
 
-func newStreamer(backend Backend, linkTTL, retryAfter time.Duration, log *slog.Logger) *streamer {
+func newStreamer(log *slog.Logger) *streamer {
 	return &streamer{
-		links: newLinkCache(backend, linkTTL),
 		// No Client.Timeout: a feature-length file legitimately streams for
 		// hours. The transport bounds the parts that should be quick.
 		//
@@ -167,9 +173,8 @@ func newStreamer(backend Backend, linkTTL, retryAfter time.Duration, log *slog.L
 				ForceAttemptHTTP2:     true,
 			},
 		},
-		log:        log,
-		retryAfter: retryAfter,
-		bufs:       sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
+		log:  log,
+		bufs: sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
 	}
 }
 
@@ -234,22 +239,18 @@ func entryTag(entry pan115.Entry) string {
 	return fmt.Sprintf(`"%x-%x"`, modTime.UnixNano(), entry.Size)
 }
 
-// serveGet streams the file, forwarding the client's range request upstream.
-func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115.Entry) {
-	id := identityOf(entry)
-	resp, err := s.open(r, entry, id)
-	if err != nil {
-		s.fail(w, r, entry, err)
-		return
-	}
+// pipe streams an already-opened upstream response to the client.
+//
+// Opening is done by the caller, inside the retry that can still replace the
+// credentials; by the time anything gets here the response is committed.
+func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, entry pan115.Entry, id identity, resp *http.Response) error {
 	defer resp.Body.Close()
 
 	// The last point at which a disagreement can still be reported: nothing has
 	// been written yet, so this can be a status code rather than a truncated
 	// file the client would take for the real one.
 	if err := id.checkLength(resp, entry.Name); err != nil {
-		s.fail(w, r, entry, err)
-		return
+		return err
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header, id)
@@ -275,6 +276,7 @@ func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115
 		// The status line is already out; all that is left is to record it.
 		s.log.Warn("upstream stopped sending", "file", entry.Name, "err", err)
 	}
+	return nil
 }
 
 // clientWriter remembers the first failure writing to the client, so that it
@@ -294,10 +296,10 @@ func (c *clientWriter) Write(p []byte) (int, error) {
 
 // open resolves the file and performs the upstream request, retrying once if
 // the CDN rejects the cached URL or the connection fails outright.
-func (s *streamer) open(r *http.Request, entry pan115.Entry, id identity) (*http.Response, error) {
+func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identity) (*http.Response, error) {
 	var lastErr error
 	for attempt := range 2 {
-		target, err := s.links.get(r.Context(), entry.PickCode)
+		target, err := e.links.get(r.Context(), entry.PickCode)
 		if err != nil {
 			return nil, err
 		}
@@ -332,7 +334,7 @@ func (s *streamer) open(r *http.Request, entry pan115.Entry, id identity) (*http
 		default:
 			resp.Body.Close()
 			lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name}
-			s.links.forget(entry.PickCode)
+			e.links.forget(entry.PickCode, target)
 			if attempt == 0 {
 				s.log.Debug("download link rejected, resolving again",
 					"file", entry.Name, "status", resp.StatusCode)
@@ -375,30 +377,6 @@ func (s *streamer) fetch(r *http.Request, entry pan115.Entry, target *pan115.Tar
 		req.Header.Set("Range", value)
 	}
 	return s.client.Do(req)
-}
-
-func (s *streamer) fail(w http.ResponseWriter, r *http.Request, entry pan115.Entry, err error) {
-	// A cancelled request context is how a client hanging up reaches us, and
-	// is nothing to report. Only this request's own context counts: a
-	// cancellation carried in err may have come from another caller that
-	// shared the work, and answering that with silence would leave a client
-	// that is still waiting holding an empty 200.
-	if r.Context().Err() != nil {
-		return
-	}
-	if !errors.Is(err, ErrUnavailable) {
-		s.log.Error("cannot stream file", "file", entry.Name, "err", err)
-	}
-
-	var notDownloadable *pan115.ErrNotDownloadable
-	switch {
-	case errors.Is(err, ErrUnavailable):
-		writeUnavailable(w, s.retryAfter)
-	case errors.As(err, &notDownloadable):
-		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
-	default:
-		http.Error(w, http.StatusText(http.StatusBadGateway), http.StatusBadGateway)
-	}
 }
 
 type upstreamError struct {

@@ -193,7 +193,7 @@ func TestDirectoryCacheIsBoundedByEntries(t *testing.T) {
 		b.dirs[id] = entries
 	}
 
-	tree := NewTree(b, "0", time.Hour)
+	tree := NewTree(context.Background(), b, "0", time.Hour)
 	for d := range 200 {
 		if _, err := tree.Children(context.Background(), fmt.Sprint("d", d)); err != nil {
 			t.Fatal(err)

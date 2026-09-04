@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/xml"
 	"errors"
@@ -21,8 +22,9 @@ import (
 
 // Options configures a Server.
 type Options struct {
-	// Backend is the 115 client.
-	Backend Backend
+	// Credentials supplies the 115 client. Static wraps one that never
+	// changes; the cookie-sync session replaces its own.
+	Credentials Credentials
 
 	// RootID is the 115 category id to mount. Empty means the account root.
 	RootID string
@@ -38,11 +40,6 @@ type Options struct {
 	// set. Leaving them empty serves the mount without authentication.
 	Username, Password string
 
-	// Unavailable reports whether the backend is in a known-bad state. When
-	// it returns true every request is refused immediately, without reaching
-	// 115 or whatever is holding its credentials. Optional.
-	Unavailable func() bool
-
 	// RetryAfter is advertised alongside a 503.
 	RetryAfter time.Duration
 
@@ -51,34 +48,34 @@ type Options struct {
 
 // Server serves a 115 account over read-only WebDAV.
 type Server struct {
-	tree   *Tree
+	epochs *epochs
 	stream *streamer
 	opts   Options
 	log    *slog.Logger
 }
 
 // New builds the server. It performs no I/O.
-func New(opts Options) *Server {
+//
+// The context bounds every piece of shared work the server will start:
+// cancelling it retires the current epoch, which cancels the listings and
+// resolves begun under it. Serving one client's bytes is not shared work and
+// runs on that request's own context, so a shutdown does not cut a stream
+// short before the HTTP server has had its chance to drain.
+func New(ctx context.Context, opts Options) *Server {
 	log := opts.Logger
 	if log == nil {
 		log = slog.Default()
 	}
 	return &Server{
-		tree:   NewTree(opts.Backend, opts.RootID, opts.DirTTL),
-		stream: newStreamer(opts.Backend, opts.LinkTTL, opts.RetryAfter, log),
+		epochs: &epochs{owner: ctx, creds: opts.Credentials, opts: opts, log: log},
+		stream: newStreamer(log),
 		opts:   opts,
 		log:    log,
 	}
 }
 
-// Flush discards every cache derived from the current credentials. It is
-// called after those credentials are replaced, at which point the channel may
-// be pointing at a different 115 account whose directory ids and pick codes
-// have nothing to do with what is cached.
-func (s *Server) Flush() {
-	s.tree.Clear()
-	s.stream.links.clear()
-}
+// Close retires the current epoch, cancelling the shared work it owns.
+func (s *Server) Close() { s.epochs.close() }
 
 // allowedMethods is what a read-only mount supports, and what OPTIONS
 // advertises. Anything outside it is refused with 405.
@@ -96,13 +93,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !s.authorised(r) {
 		recorder.Header().Set("WWW-Authenticate", `Basic realm="115", charset="UTF-8"`)
 		http.Error(recorder, "unauthorised", http.StatusUnauthorized)
-		return
-	}
-
-	// While the backend is known to be unusable, refuse everything up front:
-	// no request to 115, none to whatever holds its credentials.
-	if s.opts.Unavailable != nil && s.opts.Unavailable() && r.Method != http.MethodOptions {
-		s.serveUnavailable(recorder)
 		return
 	}
 
@@ -153,9 +143,11 @@ func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := s.snapshot(r.Context(), r.URL.Path, depth)
+	snap, err := withEpoch(s.epochs, r.Context(), func(e *epoch) (snapshot, error) {
+		return e.snapshot(r.Context(), r.URL.Path, depth)
+	})
 	if err != nil {
-		s.replyLookupError(w, r, err)
+		s.replyError(w, r, pan115.Entry{}, err)
 		return
 	}
 
@@ -203,20 +195,46 @@ func (s *Server) serveOptions(w http.ResponseWriter) {
 // serveContent handles GET and HEAD, routing files to the streaming proxy and
 // directories to a plain index that is only there for eyeballing the mount.
 func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
-	entry, err := s.tree.Lookup(r.Context(), r.URL.Path)
+	// Looking the path up and opening the upstream response happen inside one
+	// retry, for two reasons. A login that expired is usually discovered at the
+	// resolve rather than the lookup -- listings are cached for minutes while
+	// resolves happen constantly -- so a retry that covered only the lookup
+	// would almost never fire. And nothing has been written to the client at
+	// this point, so replacing the credentials and starting again is still
+	// possible. Past here it is not.
+	got, err := withEpoch(s.epochs, r.Context(), func(e *epoch) (content, error) {
+		entry, err := e.tree.Lookup(r.Context(), r.URL.Path)
+		if err != nil || entry.IsDir || r.Method == http.MethodHead {
+			return content{epoch: e, entry: entry}, err
+		}
+		id := identityOf(entry)
+		resp, err := s.stream.open(r, e, entry, id)
+		return content{epoch: e, entry: entry, id: id, resp: resp}, err
+	})
 	if err != nil {
-		s.replyLookupError(w, r, err)
+		s.replyError(w, r, got.entry, err)
 		return
 	}
 
 	switch {
-	case entry.IsDir:
-		s.serveIndex(w, r, entry)
+	case got.entry.IsDir:
+		s.serveIndex(w, r, got.epoch, got.entry)
 	case r.Method == http.MethodHead:
-		s.stream.serveHead(w, entry)
+		s.stream.serveHead(w, got.entry)
 	default:
-		s.stream.serveGet(w, r, entry)
+		if err := s.stream.pipe(w, r, got.entry, got.id, got.resp); err != nil {
+			s.replyError(w, r, got.entry, err)
+		}
 	}
+}
+
+// content is everything one GET or HEAD needs, gathered under a single set of
+// credentials.
+type content struct {
+	epoch *epoch
+	entry pan115.Entry
+	id    identity
+	resp  *http.Response // nil for HEAD and for directories
 }
 
 func (s *Server) serveUnavailable(w http.ResponseWriter) {
@@ -233,31 +251,49 @@ func writeUnavailable(w http.ResponseWriter, retryAfter time.Duration) {
 	http.Error(w, "115 credentials are being refreshed", http.StatusServiceUnavailable)
 }
 
-func (s *Server) replyLookupError(w http.ResponseWriter, r *http.Request, err error) {
+// replyError turns a failure into a status code. It is the single place that
+// decides, so that a lookup and a stream cannot disagree about what, say, an
+// expired login means.
+//
+// The entry may be zero, when the failure happened before the path resolved.
+func (s *Server) replyError(w http.ResponseWriter, r *http.Request, entry pan115.Entry, err error) {
+	// A cancelled request context is how a client hanging up reaches us, and is
+	// nothing to report. Only this request's own context counts: a cancellation
+	// carried in err may have come from another caller that shared the work,
+	// and answering that with silence would leave a client that is still
+	// waiting holding an empty 200.
+	if r.Context().Err() != nil {
+		return
+	}
+
+	var notDownloadable *pan115.ErrNotDownloadable
 	switch {
-	case errors.Is(err, ErrUnavailable):
+	case errors.Is(err, errNoCredentials), errors.Is(err, ErrUnavailable):
 		s.serveUnavailable(w)
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, pan115.ErrNotFound):
 		http.NotFound(w, r)
+	case errors.As(err, &notDownloadable):
+		s.log.Error("115 will not serve this file", "path", r.URL.Path, "err", err)
+		http.Error(w, http.StatusText(http.StatusForbidden), http.StatusForbidden)
 	case errors.Is(err, pan115.ErrNotAuthorized):
 		s.log.Error("115 rejected the session", "err", err)
 		http.Error(w, "115 login expired", http.StatusBadGateway)
 	default:
-		s.log.Error("lookup failed", "path", r.URL.Path, "err", err)
+		s.log.Error("cannot serve", "path", r.URL.Path, "file", entry.Name, "err", err)
 		http.Error(w, "upstream error", http.StatusBadGateway)
 	}
 }
 
-func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request, entry pan115.Entry) {
+func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request, e *epoch, entry pan115.Entry) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	children, err := s.tree.Children(r.Context(), entry.ID)
+	children, err := e.tree.Children(r.Context(), entry.ID)
 	if err != nil {
-		s.replyLookupError(w, r, err)
+		s.replyError(w, r, pan115.Entry{}, err)
 		return
 	}
 

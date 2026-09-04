@@ -43,15 +43,15 @@ type snapshot struct {
 }
 
 // snapshot resolves the whole response up front.
-func (s *Server) snapshot(ctx context.Context, name string, depth int) (snapshot, error) {
-	entry, err := s.tree.Lookup(ctx, name)
+func (e *epoch) snapshot(ctx context.Context, name string, depth int) (snapshot, error) {
+	entry, err := e.tree.Lookup(ctx, name)
 	if err != nil {
 		return snapshot{}, err
 	}
 
 	snap := snapshot{base: path.Clean("/" + strings.Trim(name, "/")), self: entry}
 	if depth == 1 && entry.IsDir {
-		if snap.children, err = s.tree.Children(ctx, entry.ID); err != nil {
+		if snap.children, err = e.tree.Children(ctx, entry.ID); err != nil {
 			return snapshot{}, err
 		}
 	}

@@ -33,6 +33,7 @@ type fakeBackend struct {
 	generation atomic.Int64
 
 	listErr       atomic.Pointer[error]
+	resolveErr    atomic.Pointer[error]
 	dropOnce      atomic.Bool
 	beforeList    func()
 	beforeResolve func()
@@ -113,6 +114,10 @@ func (b *fakeBackend) List(ctx context.Context, id string) ([]pan115.Entry, erro
 // login or a dead network reaches the WebDAV layer.
 func (b *fakeBackend) failListings(err error) { b.listErr.Store(&err) }
 
+// failResolves does the same for the download endpoint, which is where an
+// expiry is usually met: listings are cached for minutes, resolves are not.
+func (b *fakeBackend) failResolves(err error) { b.resolveErr.Store(&err) }
+
 func (b *fakeBackend) Resolve(ctx context.Context, pickCode string) (*pan115.Target, error) {
 	b.resolveCalls.Add(1)
 	if b.beforeResolve != nil {
@@ -120,6 +125,9 @@ func (b *fakeBackend) Resolve(ctx context.Context, pickCode string) (*pan115.Tar
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if err := b.resolveErr.Load(); err != nil {
+		return nil, *err
 	}
 	if _, ok := b.blobs[pickCode]; !ok {
 		return nil, &pan115.ErrNotDownloadable{PickCode: pickCode}
@@ -155,7 +163,9 @@ func sample(t *testing.T) *fakeBackend {
 
 func newTestServer(t *testing.T, b *fakeBackend, opts Options) *httptest.Server {
 	t.Helper()
-	opts.Backend = b
+	if opts.Credentials == nil {
+		opts.Credentials = Static{B: b}
+	}
 	if opts.DirTTL == 0 {
 		opts.DirTTL = time.Minute
 	}
@@ -166,7 +176,7 @@ func newTestServer(t *testing.T, b *fakeBackend, opts Options) *httptest.Server 
 		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 
-	srv := httptest.NewServer(New(opts))
+	srv := httptest.NewServer(New(context.Background(), opts))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -575,14 +585,51 @@ func TestUnboundedPropfindIsRefused(t *testing.T) {
 	}
 }
 
-// While the backend is known to be unusable, nothing is asked of it at all.
-func TestUnavailableShortCircuitsEverything(t *testing.T) {
+// fakeCredentials stands in for whatever holds the 115 login: it hands out
+// backends in order, can refuse to supply one at all, and records rejections.
+type fakeCredentials struct {
+	mu       sync.Mutex
+	queue    []Backend
+	err      error
+	handed   []Backend
+	rejected []Backend
+}
+
+func (c *fakeCredentials) Backend(context.Context) (Backend, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err != nil {
+		return nil, c.err
+	}
+	if len(c.queue) == 0 {
+		return nil, errors.New("no credentials left")
+	}
+	next := c.queue[0]
+	if len(c.queue) > 1 {
+		c.queue = c.queue[1:]
+	}
+	c.handed = append(c.handed, next)
+	return next, nil
+}
+
+func (c *fakeCredentials) Reject(backend Backend) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.rejected = append(c.rejected, backend)
+}
+
+func (c *fakeCredentials) counts() (handed, rejected int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.handed), len(c.rejected)
+}
+
+// A source with nothing usable to give refuses every request outright, without
+// asking 115 anything -- which is the point of the blackout it is reporting.
+func TestNoCredentialsRefusesEverythingWithoutAsking115(t *testing.T) {
 	b := sample(t)
-	down := true
-	srv := newTestServer(t, b, Options{
-		Unavailable: func() bool { return down },
-		RetryAfter:  15 * time.Second,
-	})
+	creds := &fakeCredentials{queue: []Backend{b}, err: errors.New("waiting for a new login")}
+	srv := newTestServer(t, b, Options{Credentials: creds, RetryAfter: 15 * time.Second})
 
 	for _, tc := range []struct{ method, path string }{
 		{"PROPFIND", "/"}, {http.MethodGet, "/film.mkv"}, {http.MethodHead, "/film.mkv"}, {http.MethodGet, "/"},
@@ -591,9 +638,12 @@ func TestUnavailableShortCircuitsEverything(t *testing.T) {
 		if resp.StatusCode != http.StatusServiceUnavailable {
 			t.Errorf("%s %s = %d, want 503", tc.method, tc.path, resp.StatusCode)
 		}
+		if resp.Header.Get("Retry-After") == "" {
+			t.Errorf("%s %s carried no Retry-After", tc.method, tc.path)
+		}
 	}
 	if n := b.listCalls.Load() + b.resolveCalls.Load(); n != 0 {
-		t.Errorf("made %d backend calls while unavailable, want 0", n)
+		t.Errorf("made %d backend calls with no credentials, want 0", n)
 	}
 
 	// OPTIONS still answers, so a client can tell the mount apart from a dead
@@ -602,41 +652,105 @@ func TestUnavailableShortCircuitsEverything(t *testing.T) {
 		t.Errorf("OPTIONS = %d, want 200 even while unavailable", resp.StatusCode)
 	}
 
-	down = false
+	creds.mu.Lock()
+	creds.err = nil
+	creds.mu.Unlock()
 	if resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
 		t.Errorf("status = %d after recovery, want 207", resp.StatusCode)
 	}
 }
 
-// Flush is what makes a credential swap safe: nothing resolved under the old
-// identity may be served after it.
-func TestFlushDropsEveryCache(t *testing.T) {
+// Replacing the credentials must replace everything derived from them. The
+// channel may by then hold a different 115 account, whose directory ids and
+// pick codes mean nothing here -- so serving one cached entry from before the
+// swap is serving another account's file.
+//
+// Nothing is emptied to achieve this. The caches belong to the epoch that was
+// retired, and the new epoch simply has its own.
+func TestNothingCachedUnderOldCredentialsSurvivesTheSwap(t *testing.T) {
+	first, second := sample(t), sample(t)
+	second.blobs["pc-film"] = []byte("a completely different film")
+	second.dirs["0"][1] = pan115.Entry{
+		ID: "f9", Name: "film.mkv", Size: int64(len(second.blobs["pc-film"])),
+		PickCode: "pc-film", SHA1: "different", ModTime: time.Unix(1700000100, 0),
+	}
+
+	creds := &fakeCredentials{queue: []Backend{first, second}}
+	srv := newTestServer(t, first, Options{
+		Credentials: creds, DirTTL: time.Hour, LinkTTL: time.Hour,
+	})
+
+	if got := body(t, do(t, srv, http.MethodGet, "/film.mkv", nil)); !strings.HasPrefix(got, "film-payload-") {
+		t.Fatalf("first read served %.20q, want the first account's film", got)
+	}
+	listed, resolved := first.listCalls.Load(), first.resolveCalls.Load()
+
+	// Warm: neither the listing nor the link is fetched again.
+	do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if first.listCalls.Load() != listed || first.resolveCalls.Load() != resolved {
+		t.Fatal("a warm cache still went to the backend")
+	}
+
+	// 115 stops accepting the login. It is discovered by the next request that
+	// actually needs the backend -- a warm cache cannot notice, and does not
+	// have to: it is discarded on the swap either way, which is the point.
+	first.failListings(pan115.ErrNotAuthorized)
+	if resp := do(t, srv, "PROPFIND", "/Movies", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("the request that met the expiry got %d, want it served from the new credentials", resp.StatusCode)
+	}
+
+	got := body(t, do(t, srv, http.MethodGet, "/film.mkv", nil))
+	if got != "a completely different film" {
+		t.Errorf("after the swap the mount served %q, want the second account's film", got)
+	}
+	if handed, rejected := creds.counts(); handed != 2 || rejected != 1 {
+		t.Errorf("credentials handed out %d times and rejected %d, want 2 and 1", handed, rejected)
+	}
+	if second.resolveCalls.Load() == 0 {
+		t.Error("the link cache from the old credentials was reused after the swap")
+	}
+}
+
+// Retiring an epoch cancels the shared work started under it. Without that,
+// a listing already in flight would finish against credentials that have been
+// abandoned and store its result -- and if the caches outlived the swap, that
+// result would then be served.
+func TestRetiringAnEpochCancelsItsSharedWork(t *testing.T) {
 	b := sample(t)
-	server := New(Options{
-		Backend: b, DirTTL: time.Hour, LinkTTL: time.Hour,
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	b.beforeList = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+
+	creds := &fakeCredentials{queue: []Backend{b}}
+	server := New(context.Background(), Options{
+		Credentials: creds, DirTTL: time.Hour, LinkTTL: time.Hour,
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	srv := httptest.NewServer(server)
 	t.Cleanup(srv.Close)
 
-	if resp := do(t, srv, http.MethodGet, "/film.mkv", nil); resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
-	listed, resolved := b.listCalls.Load(), b.resolveCalls.Load()
+	done := make(chan int, 1)
+	go func() {
+		resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"})
+		done <- resp.StatusCode
+	}()
+	<-entered
 
-	// Warm: neither the listing nor the link is fetched again.
-	do(t, srv, http.MethodGet, "/film.mkv", nil)
-	if b.listCalls.Load() != listed || b.resolveCalls.Load() != resolved {
-		t.Fatal("a warm cache still went to the backend")
-	}
+	// The credentials this listing was started under are retired underneath it.
+	server.epochs.close()
+	close(release)
 
-	server.Flush()
-	do(t, srv, http.MethodGet, "/film.mkv", nil)
-	if b.listCalls.Load() <= listed {
-		t.Error("the directory cache survived a flush")
-	}
-	if b.resolveCalls.Load() <= resolved {
-		t.Error("the link cache survived a flush")
+	select {
+	case status := <-done:
+		if status == http.StatusMultiStatus {
+			t.Error("a listing survived the retirement of the credentials it was made with")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never finished after its epoch was retired")
 	}
 }
 
@@ -735,5 +849,46 @@ func TestUpstreamFailureIsReportedAfterOneRetry(t *testing.T) {
 	resp := do(t, srv, http.MethodGet, "/gone.mkv", nil)
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status = %d, want 502", resp.StatusCode)
+	}
+}
+
+// The login usually expires while the directory listing is still cached, so
+// the first thing to notice is the resolve -- not the lookup. A retry that
+// covered only the lookup would almost never fire, and the player would get a
+// 502 for a mount that could have healed itself.
+//
+// Nothing has been written to the client at that point, which is what makes
+// starting again with new credentials possible at all.
+func TestAnExpiryFoundAtResolveTimeStillRecovers(t *testing.T) {
+	first, second := sample(t), sample(t)
+	second.blobs["pc-film"] = []byte("served by the replacement login")
+	second.dirs["0"][1] = pan115.Entry{
+		ID: "f1", Name: "film.mkv", Size: int64(len(second.blobs["pc-film"])),
+		PickCode: "pc-film", SHA1: "abc123", ModTime: time.Unix(1700000100, 0),
+	}
+
+	creds := &fakeCredentials{queue: []Backend{first, second}}
+	srv := newTestServer(t, first, Options{Credentials: creds, DirTTL: time.Hour, LinkTTL: time.Hour})
+
+	// Warm the listing, so the lookup below cannot be what notices.
+	if resp := do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}); resp.StatusCode != http.StatusMultiStatus {
+		t.Fatalf("warm-up = %d, want 207", resp.StatusCode)
+	}
+	listed := first.listCalls.Load()
+
+	first.failResolves(pan115.ErrNotAuthorized)
+
+	resp := do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 -- the mount did not recover from an expiry met at resolve time", resp.StatusCode)
+	}
+	if got := body(t, resp); got != "served by the replacement login" {
+		t.Errorf("served %q, want the replacement account's film", got)
+	}
+	if first.listCalls.Load() != listed {
+		t.Error("the warm listing was refetched; the lookup was not the thing that noticed")
+	}
+	if handed, rejected := creds.counts(); handed != 2 || rejected != 1 {
+		t.Errorf("credentials handed out %d times and rejected %d, want 2 and 1", handed, rejected)
 	}
 }

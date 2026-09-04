@@ -109,7 +109,7 @@ func TestLookupWalksAndCaches(t *testing.T) {
 		"d1": {{ID: "d2", Name: "S1", IsDir: true}},
 		"d2": {{ID: "f1", Name: "ep1.mkv", PickCode: "pc1", Size: 42}},
 	}}
-	tree := NewTree(backend, "0", time.Minute)
+	tree := NewTree(context.Background(), backend, "0", time.Minute)
 
 	entry, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv")
 	if err != nil {
@@ -134,7 +134,7 @@ func TestLookupMissing(t *testing.T) {
 	backend := &stubBackend{dirs: map[string][]pan115.Entry{
 		"0": {{ID: "f1", Name: "film.mkv", PickCode: "pc1"}},
 	}}
-	tree := NewTree(backend, "0", time.Minute)
+	tree := NewTree(context.Background(), backend, "0", time.Minute)
 
 	for _, path := range []string{
 		"/nope.mkv",
@@ -150,7 +150,7 @@ func TestExpiredListingIsRefetched(t *testing.T) {
 	backend := &stubBackend{dirs: map[string][]pan115.Entry{
 		"0": {{ID: "f1", Name: "film.mkv"}},
 	}}
-	tree := NewTree(backend, "0", time.Nanosecond)
+	tree := NewTree(context.Background(), backend, "0", time.Nanosecond)
 
 	for range 3 {
 		if _, err := tree.Children(context.Background(), "0"); err != nil {
@@ -170,7 +170,7 @@ func TestConcurrentMissesCollapse(t *testing.T) {
 		dirs:  map[string][]pan115.Entry{"0": {{ID: "f1", Name: "film.mkv"}}},
 		delay: 20 * time.Millisecond,
 	}
-	tree := NewTree(backend, "0", time.Minute)
+	tree := NewTree(context.Background(), backend, "0", time.Minute)
 
 	var wg sync.WaitGroup
 	for range 16 {
@@ -191,7 +191,7 @@ func TestConcurrentMissesCollapse(t *testing.T) {
 
 func TestForgetDropsCache(t *testing.T) {
 	backend := &stubBackend{dirs: map[string][]pan115.Entry{"0": {{ID: "f1", Name: "a.mkv"}}}}
-	tree := NewTree(backend, "0", time.Hour)
+	tree := NewTree(context.Background(), backend, "0", time.Hour)
 
 	if _, err := tree.Children(context.Background(), "0"); err != nil {
 		t.Fatal(err)
@@ -222,7 +222,7 @@ func (r *resolveAny) Resolve(_ context.Context, pickCode string) (*pan115.Target
 // without this a library walked once would be retained for the life of the
 // process.
 func TestExpiredLinkIsEvicted(t *testing.T) {
-	cache := newLinkCache(&resolveAny{}, time.Nanosecond)
+	cache := newLinkCache(context.Background(), &resolveAny{}, time.Nanosecond)
 
 	if _, err := cache.get(context.Background(), "pc-1"); err != nil {
 		t.Fatal(err)
@@ -242,7 +242,7 @@ func TestExpiredLinkIsEvicted(t *testing.T) {
 
 func TestLinkCacheStaysBounded(t *testing.T) {
 	backend := &resolveAny{}
-	cache := newLinkCache(backend, time.Hour) // nothing expires on its own
+	cache := newLinkCache(context.Background(), backend, time.Hour) // nothing expires on its own
 
 	for i := range maxCachedLinks + 500 {
 		if _, err := cache.get(context.Background(), fmt.Sprintf("pc-%d", i)); err != nil {

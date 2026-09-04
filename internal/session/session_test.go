@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/q741451/115dav/internal/cookiesync"
-	"github.com/q741451/115dav/internal/dav"
 	"github.com/q741451/115dav/internal/pan115"
 )
 
@@ -52,7 +51,6 @@ type harness struct {
 	src      *source
 	accepted atomic.Value // string: the cookie 115 currently accepts
 	calls    atomic.Int64
-	flushes  atomic.Int64
 }
 
 func newHarness(t *testing.T, startCookie, accepts string) *harness {
@@ -74,21 +72,44 @@ func newHarness(t *testing.T, startCookie, accepts string) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.OnRefresh(func() { h.flushes.Add(1) })
 	h.Session = s
 	return h
 }
 
-// call runs one operation through the refresh machinery, standing in for
-// List or Resolve.
+// call makes one attempt against 115 with whatever cookies the session is
+// holding, and reports a rejection back the way the WebDAV layer does.
+//
+// It is deliberately a single attempt. Retrying, and giving up when the retry
+// fails too, is the caller's logic and lives in internal/dav; repeating it
+// here would test the harness rather than the session.
 func (h *harness) call(ctx context.Context) (string, error) {
-	return withRefresh(h.Session, ctx, func(c *pan115.Client) (string, error) {
-		h.calls.Add(1)
-		if h.currentCookie() != h.accepted.Load().(string) {
-			return "", fmt.Errorf("%w: 登录超时", pan115.ErrNotAuthorized)
-		}
-		return "ok", nil
-	})
+	client, err := h.Client(ctx)
+	if err != nil {
+		return "", err
+	}
+	h.calls.Add(1)
+	if h.heldCookie() != h.accepted.Load().(string) {
+		h.Reject(client)
+		return "", fmt.Errorf("%w: 登录超时", pan115.ErrNotAuthorized)
+	}
+	return "ok", nil
+}
+
+// twice is call, retried once against whatever the session produces next --
+// the shape internal/dav uses.
+func (h *harness) twice(ctx context.Context) (string, error) {
+	got, err := h.call(ctx)
+	if !errors.Is(err, pan115.ErrNotAuthorized) {
+		return got, err
+	}
+	return h.call(ctx)
+}
+
+func (h *harness) heldCookie() string {
+	if cookie := h.cookie.Load(); cookie != nil {
+		return *cookie
+	}
+	return ""
 }
 
 func TestServesWhileCookiesAreGood(t *testing.T) {
@@ -110,17 +131,14 @@ func TestRefreshesWhenRejected(t *testing.T) {
 	h := newHarness(t, cookie("old"), cookie("new")) // 115 has already moved on
 	h.src.set(cookie("new"), nil)                    // and the channel already has the new login
 
-	got, err := h.call(context.Background())
+	got, err := h.twice(context.Background())
 	if err != nil || got != "ok" {
 		t.Fatalf("call = %q, %v; want ok", got, err)
 	}
 	if n := h.src.fetches.Load(); n != 1 {
 		t.Errorf("fetched %d times, want 1", n)
 	}
-	if n := h.flushes.Load(); n != 1 {
-		t.Errorf("flushed %d times, want 1 -- caches from the old identity must go", n)
-	}
-	if h.Blocked() {
+	if h.blocked() {
 		t.Error("blocked after a successful refresh")
 	}
 }
@@ -131,13 +149,13 @@ func TestDoesNotRetry115WithUnchangedCookies(t *testing.T) {
 	h := newHarness(t, cookie("old"), cookie("new"))
 	h.src.set(cookie("old"), nil) // nobody has uploaded anything yet
 
-	if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+	if _, err := h.twice(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
 	if n := h.calls.Load(); n != 1 {
 		t.Errorf("called 115 %d times, want 1 -- the second attempt was pointless", n)
 	}
-	if !h.Blocked() {
+	if !h.blocked() {
 		t.Error("not blocked after finding nothing new")
 	}
 }
@@ -147,13 +165,13 @@ func TestBlackoutTouchesNothing(t *testing.T) {
 	h := newHarness(t, cookie("old"), cookie("new"))
 	h.src.set(cookie("old"), nil)
 
-	if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+	if _, err := h.twice(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatal(err)
 	}
 	calls, fetches := h.calls.Load(), h.src.fetches.Load()
 
 	for range 5 {
-		if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+		if _, err := h.call(context.Background()); !errors.Is(err, ErrUnavailable) {
 			t.Fatalf("err = %v, want ErrUnavailable during the blackout", err)
 		}
 	}
@@ -170,7 +188,7 @@ func TestRecoversAfterBlackout(t *testing.T) {
 	h := newHarness(t, cookie("old"), cookie("new"))
 	h.src.set(cookie("old"), nil)
 
-	if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+	if _, err := h.twice(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatal(err)
 	}
 	h.src.set(cookie("new"), nil) // the browser login finally happened
@@ -187,10 +205,10 @@ func TestRejectedChannelBlocksButDoesNotFail(t *testing.T) {
 	h := newHarness(t, cookie("old"), cookie("new"))
 	h.src.set("", cookiesync.ErrRejected)
 
-	if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+	if _, err := h.twice(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
-	if !h.Blocked() {
+	if !h.blocked() {
 		t.Error("not blocked after the server refused the channel")
 	}
 }
@@ -201,10 +219,10 @@ func TestUnusableCookiesAreTreatedAsStale(t *testing.T) {
 	h := newHarness(t, cookie("current"), cookie("unreachable"))
 	h.src.set("UID=a; CID=b", nil) // no SEID, no KID: pan115.New will refuse
 
-	if _, err := h.call(context.Background()); !errors.Is(err, dav.ErrUnavailable) {
+	if _, err := h.twice(context.Background()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v, want ErrUnavailable", err)
 	}
-	if !h.Blocked() {
+	if !h.blocked() {
 		t.Error("not blocked after receiving an unusable cookie")
 	}
 }
@@ -220,7 +238,7 @@ func TestConcurrentRejectionsFetchOnce(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := h.call(context.Background()); err != nil {
+			if _, err := h.twice(context.Background()); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -246,10 +264,9 @@ func TestStartsWithoutACookie(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s.OnRefresh(func() { h.flushes.Add(1) })
 	h.Session = s
 
-	if got, err := h.call(context.Background()); err != nil || got != "ok" {
+	if got, err := h.twice(context.Background()); err != nil || got != "ok" {
 		t.Fatalf("call = %q, %v; want ok", got, err)
 	}
 	if n := h.src.fetches.Load(); n != 1 {

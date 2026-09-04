@@ -38,6 +38,10 @@ type Backend interface {
 // segment at a time. Listings are cached, which is what keeps that walk cheap
 // and keeps a media scanner from melting the API rate limit.
 type Tree struct {
+	// owner bounds the listings this tree fetches. It belongs to the epoch
+	// that built the tree, so retiring those credentials cancels the work
+	// begun under them rather than leaving it to land in a cache nobody reads.
+	owner   context.Context
 	backend Backend
 	rootID  string
 	ttl     time.Duration
@@ -74,11 +78,12 @@ type directory struct {
 
 // NewTree returns a Tree rooted at the given 115 category id. An empty rootID
 // means the account root.
-func NewTree(backend Backend, rootID string, ttl time.Duration) *Tree {
+func NewTree(owner context.Context, backend Backend, rootID string, ttl time.Duration) *Tree {
 	if rootID == "" {
 		rootID = pan115.RootID
 	}
 	return &Tree{
+		owner:   owner,
 		backend: backend,
 		rootID:  rootID,
 		ttl:     ttl,
@@ -131,10 +136,11 @@ func (t *Tree) children(ctx context.Context, id string) (*directory, error) {
 			return dir, nil
 		}
 		// The listing is shared with everyone else waiting on this id, so it
-		// must not be tied to whichever request happened to start it: that
-		// caller may hang up -- players do, constantly -- and the rest would
-		// inherit its cancellation.
-		fetch, cancel := context.WithTimeout(context.WithoutCancel(ctx), listTimeout)
+		// is not tied to whichever request happened to start it: that caller
+		// may hang up -- players do, constantly -- and the rest would inherit
+		// its cancellation. It hangs off the epoch instead, which is what the
+		// listing actually belongs to.
+		fetch, cancel := context.WithTimeout(t.owner, listTimeout)
 		defer cancel()
 
 		entries, err := t.backend.List(fetch, id)
@@ -203,15 +209,6 @@ func (t *Tree) sweepLocked(keep string) {
 		t.dirs[keep] = kept
 		t.entries = len(kept.entries)
 	}
-}
-
-// Clear empties the cache. Used when the credentials change: the listings
-// were made under an identity that may not even be the same account.
-func (t *Tree) Clear() {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	clear(t.dirs)
-	t.entries = 0
 }
 
 // Forget drops any cached listing for a directory.

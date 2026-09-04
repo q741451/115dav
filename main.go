@@ -93,38 +93,39 @@ func run() error {
 	}
 
 	var (
-		backend     dav.Backend
-		unavailable func() bool
-		onServer    func(*dav.Server)
-		err         error
+		creds dav.Credentials
+		err   error
 	)
 	if opts.cookieServer != "" {
 		var synced *session.Session
 		if synced, err = openSynced(opts, build, log); err == nil {
-			backend, unavailable = synced, synced.Blocked
-			onServer = func(s *dav.Server) { synced.OnRefresh(s.Flush) }
+			creds = subscribed{synced}
 		}
 	} else {
-		backend, err = openStatic(opts, build, log)
+		creds, err = openStatic(opts, build, log)
 	}
 	if err != nil {
 		return err
 	}
 
-	handler := dav.New(dav.Options{
-		Backend:     backend,
+	// Cancelled at shutdown, which retires the credentials in use and with
+	// them the listings and resolves begun under those credentials. Streaming
+	// a file is not shared work and is not cancelled here; the HTTP server's
+	// own drain window covers that.
+	ctx, retire := context.WithCancel(context.Background())
+	defer retire()
+
+	handler := dav.New(ctx, dav.Options{
+		Credentials: creds,
 		RootID:      opts.root,
 		DirTTL:      opts.dirTTL,
 		LinkTTL:     opts.linkTTL,
 		Username:    opts.username,
 		Password:    opts.password,
-		Unavailable: unavailable,
 		RetryAfter:  opts.cookieRetry,
 		Logger:      log,
 	})
-	if onServer != nil {
-		onServer(handler)
-	}
+	defer handler.Close()
 
 	server := &http.Server{
 		Addr:    opts.listen,
@@ -185,7 +186,7 @@ func serve(server *http.Server, log *slog.Logger, opts options) error {
 //
 // The cookie is checked against 115 before serving starts: it cannot be
 // replaced without a restart, so a bad one is worth failing on immediately.
-func openStatic(opts options, build func(string) (*pan115.Client, error), log *slog.Logger) (dav.Backend, error) {
+func openStatic(opts options, build func(string) (*pan115.Client, error), log *slog.Logger) (dav.Credentials, error) {
 	cookie, err := readCookie(opts)
 	if err != nil {
 		return nil, err
@@ -201,7 +202,7 @@ func openStatic(opts options, build func(string) (*pan115.Client, error), log *s
 		return nil, fmt.Errorf("cannot reach 115: %w", err)
 	}
 	log.Info("115 session accepted", "root", opts.root)
-	return client, nil
+	return dav.Static{B: client}, nil
 }
 
 // openSynced builds a backend that reads its cookie from a cookie-sync server
@@ -270,6 +271,24 @@ func openSynced(opts options, build func(string) (*pan115.Client, error), log *s
 		Logger:   log,
 	})
 }
+
+// subscribed adapts a cookie-sync session to what the WebDAV server asks of a
+// credential source.
+//
+// It lives here, in the wiring, because it is the only place that has to know
+// both halves: internal/dav knows nothing about cookies, and internal/session
+// knows nothing about HTTP. Neither imports the other.
+type subscribed struct{ *session.Session }
+
+func (s subscribed) Backend(ctx context.Context) (dav.Backend, error) {
+	client, err := s.Client(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+func (s subscribed) Reject(backend dav.Backend) { s.Session.Reject(backend) }
 
 // readCookieKey takes the channel key from whichever source was configured.
 func readCookieKey(opts options) (string, error) {
