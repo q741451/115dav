@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -146,10 +145,36 @@ func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115
 
 	buf := s.bufs.Get().(*[]byte)
 	defer s.bufs.Put(buf)
-	if _, err := io.CopyBuffer(w, resp.Body, *buf); err != nil && !isClientGone(err) {
+
+	// io.Copy reports a single error for both halves of the transfer, so wrap
+	// the client side to find out which one failed. The distinction matters:
+	// a player hanging up is routine, a CDN going quiet mid-file is not.
+	client := &clientWriter{Writer: w}
+	switch _, err := io.CopyBuffer(client, resp.Body, *buf); {
+	case err == nil:
+	case client.err != nil:
+		// Players close connections constantly: after probing a container,
+		// on every seek, and when playback stops.
+		s.log.Debug("player closed the stream", "file", entry.Name, "err", err)
+	default:
 		// The status line is already out; all that is left is to record it.
-		s.log.Warn("stream interrupted", "file", entry.Name, "err", err)
+		s.log.Warn("upstream stopped sending", "file", entry.Name, "err", err)
 	}
+}
+
+// clientWriter remembers the first failure writing to the client, so that it
+// can be told apart from a failure reading from the CDN.
+type clientWriter struct {
+	io.Writer
+	err error
+}
+
+func (c *clientWriter) Write(p []byte) (int, error) {
+	n, err := c.Writer.Write(p)
+	if err != nil && c.err == nil {
+		c.err = err
+	}
+	return n, err
 }
 
 // open resolves the file and performs the upstream request, retrying once with
@@ -198,7 +223,9 @@ func (s *streamer) fetch(r *http.Request, target *pan115.Target) (*http.Response
 }
 
 func (s *streamer) fail(w http.ResponseWriter, r *http.Request, entry pan115.Entry, err error) {
-	if isClientGone(err) || r.Context().Err() != nil {
+	// A cancelled request context is how a client hanging up reaches us, and
+	// is nothing to report.
+	if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
 		return
 	}
 	s.log.Error("cannot stream file", "file", entry.Name, "err", err)
@@ -231,15 +258,6 @@ func isExpired(status int) bool {
 		return true
 	}
 	return false
-}
-
-// isClientGone reports whether an error just means the player hung up, which
-// happens constantly during seeking and is not worth logging as a failure.
-func isClientGone(err error) bool {
-	return errors.Is(err, context.Canceled) ||
-		errors.Is(err, syscall.EPIPE) ||
-		errors.Is(err, syscall.ECONNRESET) ||
-		errors.Is(err, net.ErrClosed)
 }
 
 // passthroughHeaders are copied from the CDN response as-is. Everything else,

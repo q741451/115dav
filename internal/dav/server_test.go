@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -125,7 +127,9 @@ func newTestServer(t *testing.T, b *fakeBackend, opts Options) *httptest.Server 
 	if opts.LinkTTL == 0 {
 		opts.LinkTTL = time.Hour
 	}
-	opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 
 	srv := httptest.NewServer(New(opts))
 	t.Cleanup(srv.Close)
@@ -392,4 +396,63 @@ func TestDirectoryIndex(t *testing.T) {
 			t.Errorf("index is missing %q\n%s", want, page)
 		}
 	}
+}
+
+// A player hanging up mid-stream is routine: it happens after probing a
+// container, on every seek, and when playback stops. It must not be reported
+// as a failure. The Windows socket errors for it do not match the Unix errno
+// names, which is how these came to be logged as warnings, so the check is on
+// which half of the copy failed rather than on any error code.
+func TestClientHangupIsNotAWarning(t *testing.T) {
+	b := sample(t)
+	// Large enough that the copy is still running when the client goes away.
+	b.blobs["pc-film"] = []byte(strings.Repeat("payload-", 2<<20))
+	b.dirs["0"][1].Size = int64(len(b.blobs["pc-film"]))
+
+	var logs safeBuffer
+	srv := newTestServer(t, b, Options{
+		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/film.mkv", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(io.Discard, resp.Body, 4096); err != nil {
+		t.Fatalf("reading the start of the stream: %v", err)
+	}
+	cancel() // the player goes away mid-file
+	resp.Body.Close()
+
+	// Give the server a moment to notice the closed connection.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && !strings.Contains(logs.String(), "player closed the stream") {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := logs.String(); strings.Contains(got, "level=WARN") || strings.Contains(got, "level=ERROR") {
+		t.Errorf("a client hangup was logged as a failure:\n%s", got)
+	}
+}
+
+// safeBuffer is a bytes.Buffer usable from the serving goroutine and the test.
+type safeBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *safeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *safeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
