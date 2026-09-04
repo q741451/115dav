@@ -29,7 +29,8 @@ func (s *stubBackend) List(_ context.Context, id string) ([]pan115.Entry, error)
 	if !ok {
 		return nil, pan115.ErrNotFound
 	}
-	return entries, nil
+	// Fresh each call; the tree renames in place. See Backend.List.
+	return append([]pan115.Entry(nil), entries...), nil
 }
 
 func (s *stubBackend) Resolve(context.Context, string) (*pan115.Target, error) {
@@ -254,5 +255,45 @@ func TestLinkCacheStaysBounded(t *testing.T) {
 	}
 	if got := backend.calls.Load(); got != int64(maxCachedLinks+500) {
 		t.Errorf("resolved %d times, want %d", got, maxCachedLinks+500)
+	}
+}
+
+// The tree takes ownership of the slice List returns and renames it in place.
+// Copying it into a second slice first doubled the cost of the one thing that
+// scales with the size of a directory -- for a 50000-entry directory, several
+// megabytes of pure duplication.
+//
+// This pins the contract from the tree's side: the entries it serves are the
+// ones it was given, sanitised, and none of the work is done twice.
+func TestListingIsAdoptedRatherThanCopied(t *testing.T) {
+	given := []pan115.Entry{
+		{ID: "f1", Name: "ok.mkv", Size: 1},
+		{ID: "f2", Name: "with/slash.mkv", Size: 2},
+		{ID: "f3", Name: "ok.mkv", Size: 3}, // a duplicate, to be disambiguated
+	}
+	handed := append([]pan115.Entry(nil), given...)
+
+	dir := newDirectory(handed, time.Now().Add(time.Hour))
+
+	// Same backing array: the listing was adopted, not duplicated.
+	if len(dir.entries) != len(handed) || &dir.entries[0] != &handed[0] {
+		t.Error("newDirectory copied the listing instead of taking it")
+	}
+	// And it is the sanitised, disambiguated view that is served.
+	names := make([]string, len(dir.entries))
+	for i, e := range dir.entries {
+		names[i] = e.Name
+	}
+	want := []string{"ok.mkv", "with_slash.mkv", "ok (2).mkv"}
+	for i := range want {
+		if names[i] != want[i] {
+			t.Errorf("entry %d = %q, want %q", i, names[i], want[i])
+		}
+	}
+	// Every name resolves to the entry it belongs to.
+	for name, i := range dir.byName {
+		if dir.entries[i].Name != name {
+			t.Errorf("byName[%q] points at %q", name, dir.entries[i].Name)
+		}
 	}
 }

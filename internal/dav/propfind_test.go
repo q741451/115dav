@@ -2,6 +2,7 @@ package dav
 
 import (
 	"encoding/xml"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -302,4 +303,67 @@ func TestEveryXMLBodyIsLabelledTheSame(t *testing.T) {
 			t.Errorf("%s carried Content-Type %q, want %q", name, got, xmlContentType)
 		}
 	}
+}
+
+// The listing goes out as it is produced, rather than being built whole in
+// memory first.
+//
+// A directory of 50000 entries is 26 MB of XML. Buffering that to hand it to a
+// client which will read it at network speed costs several times what holding
+// the listing itself does, and on the routers this is built for that is the
+// difference between working and being killed. Atomicity does not depend on
+// it: the snapshot is what guarantees the response cannot be half-written,
+// which is why the buffer here can be small and fixed.
+func TestTheListingIsStreamedNotBuffered(t *testing.T) {
+	const children = 4000
+
+	b := newFakeBackend(t)
+	entries := make([]pan115.Entry, children)
+	for i := range entries {
+		entries[i] = pan115.Entry{
+			ID:      fmt.Sprint("f", i),
+			Name:    fmt.Sprintf("A Long Enough Film Name To Be Realistic %05d.mkv", i),
+			Size:    1 << 20,
+			SHA1:    "A3F3601EA6D94DF64B22BCE5A0FF2CEB0F2167F1",
+			ModTime: time.Unix(1700000000, 0),
+		}
+	}
+	b.dirs["0"] = entries
+
+	snap := snapshot{base: "/", self: pan115.Entry{Name: "/", IsDir: true}, children: entries}
+
+	// A writer that reports how much had arrived by the time the first N bytes
+	// were produced. If the document were assembled first, everything would
+	// land in one write at the end.
+	counting := &chunkCounter{}
+	if err := writeMultistatus(counting, snap, request{allprop: true}); err != nil {
+		t.Fatal(err)
+	}
+
+	if counting.total < children*100 {
+		t.Fatalf("only %d bytes written for %d entries; the fixture is too small to tell", counting.total, children)
+	}
+	// One write per flush of a 32 KB buffer, so a megabyte of XML is dozens.
+	// Buffering the document would be one or two.
+	if counting.writes < 8 {
+		t.Errorf("%d bytes went out in %d writes; the document was assembled before any of it was sent",
+			counting.total, counting.writes)
+	}
+	// And no single write may be the whole thing.
+	if counting.largest > counting.total/2 {
+		t.Errorf("a single write carried %d of %d bytes", counting.largest, counting.total)
+	}
+}
+
+type chunkCounter struct {
+	total, largest, writes int
+}
+
+func (c *chunkCounter) Write(p []byte) (int, error) {
+	c.writes++
+	c.total += len(p)
+	if len(p) > c.largest {
+		c.largest = len(p)
+	}
+	return len(p), nil
 }

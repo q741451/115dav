@@ -1,6 +1,7 @@
 package dav
 
 import (
+	"bufio"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -215,25 +216,36 @@ func (p *propNames) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	}
 }
 
-// writeMultistatus renders the snapshot. It performs no I/O of its own and
-// cannot fail for anything but the client hanging up, which is what makes a
-// half-written 207 impossible.
+// writeMultistatus renders the snapshot.
+//
+// It reads nothing and asks nobody anything: every entry it will mention is
+// already in the snapshot, so the only way it can fail is the client going
+// away. That is what makes a half-written 207 impossible -- not the buffering,
+// which is why the buffer can be a small fixed one rather than the whole
+// document.
+//
+// It matters that it is small. A directory of 50000 entries is 26 MB of XML,
+// and building that in memory to hand it to a client that will read it at
+// network speed costs four times what the listing itself does. The bytes go
+// out as they are produced instead.
+//
+// bufio.Writer keeps the first write error and returns it from Flush, so a
+// client that hangs up mid-listing is reported rather than swallowed.
 func writeMultistatus(w io.Writer, snap snapshot, req request) error {
-	var page strings.Builder
+	page := bufio.NewWriterSize(w, 32<<10)
 	page.WriteString(xml.Header)
 	page.WriteString(`<D:multistatus xmlns:D="DAV:">`)
 
-	writeResponse(&page, snap.href(snap.self, true), snap.self, req)
+	writeResponse(page, snap.href(snap.self, true), snap.self, req)
 	for _, child := range snap.children {
-		writeResponse(&page, snap.href(child, false), child, req)
+		writeResponse(page, snap.href(child, false), child, req)
 	}
 
 	page.WriteString(`</D:multistatus>`)
-	_, err := io.WriteString(w, page.String())
-	return err
+	return page.Flush()
 }
 
-func writeResponse(page *strings.Builder, href string, entry pan115.Entry, req request) {
+func writeResponse(page *bufio.Writer, href string, entry pan115.Entry, req request) {
 	page.WriteString(`<D:response><D:href>`)
 	escape(page, href)
 	page.WriteString(`</D:href>`)
@@ -292,7 +304,7 @@ func lookupProp(name xml.Name) (liveProperty, bool) {
 	return liveProperty{}, false
 }
 
-func writeProp(page *strings.Builder, entry pan115.Entry, prop liveProperty, namesOnly bool) {
+func writeProp(page *bufio.Writer, entry pan115.Entry, prop liveProperty, namesOnly bool) {
 	if namesOnly {
 		page.WriteString("<D:" + prop.name + "/>")
 		return
@@ -313,7 +325,7 @@ func writeProp(page *strings.Builder, entry pan115.Entry, prop liveProperty, nam
 
 // writeUnknownProp echoes a name the client asked for, keeping its namespace
 // so the client can match the answer to its question.
-func writeUnknownProp(page *strings.Builder, name xml.Name) {
+func writeUnknownProp(page *bufio.Writer, name xml.Name) {
 	if name.Space == "DAV:" {
 		page.WriteString("<D:" + xmlName(name.Local) + "/>")
 		return
@@ -355,7 +367,7 @@ func xmlName(local string) string {
 // there is no character reference for it. sanitiseName has already taken the
 // control characters out of any name that reaches here, so this is the second
 // line of a defence rather than the first.
-func escape(page *strings.Builder, s string) {
+func escape(page *bufio.Writer, s string) {
 	for _, r := range s {
 		switch {
 		case r == '&':

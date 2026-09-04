@@ -107,7 +107,10 @@ func (b *fakeBackend) List(ctx context.Context, id string) ([]pan115.Entry, erro
 	if !ok {
 		return nil, pan115.ErrNotFound
 	}
-	return entries, nil
+	// A fresh slice each call, as a real backend returns: the tree takes
+	// ownership and renames in place, so handing out the fixture itself would
+	// let one listing rewrite the next one's names.
+	return append([]pan115.Entry(nil), entries...), nil
 }
 
 // failListings makes every subsequent listing fail, which is how an expired

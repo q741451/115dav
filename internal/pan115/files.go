@@ -45,6 +45,10 @@ func (c *Client) CheckAccess(ctx context.Context, cid string) error {
 // pages are served cannot spin here forever.
 const maxListPages = 1000
 
+// maxPreallocEntries bounds how much is reserved up front on 115's word alone.
+// Beyond it the slice grows the ordinary way.
+const maxPreallocEntries = 50000
+
 // List returns every child of the directory with the given category id.
 //
 // It returns either the whole directory or an error. There is deliberately no
@@ -65,6 +69,15 @@ func (c *Client) List(ctx context.Context, cid string) ([]Entry, error) {
 		}
 		if err := got.check(cid, len(entries)); err != nil {
 			return nil, err
+		}
+		if entries == nil {
+			// The first page says how many there will be, so the slice is
+			// sized once instead of being grown a dozen times -- each growth
+			// copying everything collected so far and leaving it as garbage.
+			// The cap is against a count that is wrong rather than large:
+			// being told there are ten million entries should not allocate
+			// for ten million before the first one arrives.
+			entries = make([]Entry, 0, min(got.Count.value, maxPreallocEntries))
 		}
 
 		for _, item := range got.Data {

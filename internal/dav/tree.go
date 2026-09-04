@@ -28,6 +28,9 @@ var ErrUnavailable = errors.New("115 is temporarily unavailable")
 // is *pan115.Client, or a wrapper that keeps its credentials current; the
 // interface exists so the WebDAV layer can be tested without talking to 115.
 type Backend interface {
+	// List returns the children of a directory. The slice becomes the
+	// caller's: it is indexed and renamed in place rather than copied, which
+	// on a large directory is the difference between one allocation and two.
 	List(ctx context.Context, id string) ([]pan115.Entry, error)
 	Resolve(ctx context.Context, pickCode string) (*pan115.Target, error)
 }
@@ -223,16 +226,20 @@ func (t *Tree) Forget(id string) {
 
 // newDirectory indexes a listing by name, making the names unique and safe to
 // use as path segments so that the tree behaves like a real filesystem.
+//
+// It takes ownership of entries and renames them in place. Copying them into a
+// second slice first doubled the cost of the one thing here that scales with
+// the size of a directory, to no end: Backend.List returns a slice it does not
+// keep, and this is its only caller.
 func newDirectory(entries []pan115.Entry, expires time.Time) *directory {
 	dir := &directory{
-		entries: make([]pan115.Entry, 0, len(entries)),
+		entries: entries,
 		byName:  make(map[string]int, len(entries)),
 		expires: expires,
 	}
-	for _, entry := range entries {
-		entry.Name = uniqueName(dir.byName, sanitiseName(entry.Name))
-		dir.byName[entry.Name] = len(dir.entries)
-		dir.entries = append(dir.entries, entry)
+	for i := range entries {
+		entries[i].Name = uniqueName(dir.byName, sanitiseName(entries[i].Name))
+		dir.byName[entries[i].Name] = i
 	}
 	return dir
 }
