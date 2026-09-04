@@ -79,6 +79,9 @@ func run() error {
 	if err := checkModes(opts); err != nil {
 		return err
 	}
+	if err := checkLimits(opts); err != nil {
+		return err
+	}
 
 	build := func(cookie string) (*pan115.Client, error) {
 		return pan115.New(pan115.Config{
@@ -367,6 +370,24 @@ func checkModes(opts options) error {
 	}
 	if opts.cookieChannel == "" {
 		return errors.New("-cookie-server needs -cookie-channel")
+	}
+	return nil
+}
+
+// checkLimits rejects the numeric options whose failure would be silent.
+//
+// pan115.New checks what it can see, but the durations are ours: a negative
+// TTL expires every entry the moment it is stored, which does not look like a
+// misconfiguration from the outside -- it looks like the cache is not helping
+// and 115 is rate-limiting us.
+func checkLimits(opts options) error {
+	switch {
+	case opts.dirTTL < 0:
+		return fmt.Errorf("-dir-ttl must not be negative, got %s", opts.dirTTL)
+	case opts.linkTTL < 0:
+		return fmt.Errorf("-link-ttl must not be negative, got %s", opts.linkTTL)
+	case opts.cookieRetry < 0:
+		return fmt.Errorf("-cookie-retry must not be negative, got %s", opts.cookieRetry)
 	}
 	return nil
 }

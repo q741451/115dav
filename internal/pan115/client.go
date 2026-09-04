@@ -86,6 +86,9 @@ type Client struct {
 // New validates the configuration and returns a client. It performs no I/O;
 // call CheckAccess to confirm the cookie actually works.
 func New(cfg Config) (*Client, error) {
+	if err := cfg.validate(); err != nil {
+		return nil, err
+	}
 	cookie, err := normaliseCookie(cfg.Cookie)
 	if err != nil {
 		return nil, err
@@ -105,6 +108,26 @@ func New(cfg Config) (*Client, error) {
 		listURL:     apiFileList,
 		downloadURL: apiDownload,
 	}, nil
+}
+
+// validate rejects a configuration whose failure would be invisible.
+//
+// The asymmetry with the clamping above is deliberate. A page size over the
+// maximum is clamped, because the result is then correct -- just paginated
+// differently. A negative one is refused, because it reaches 115 as limit=-1,
+// which answers with no entries at all: by the time that gets back here it is
+// indistinguishable from a directory that is genuinely empty, and startup is
+// the last point where the difference is still visible.
+func (cfg Config) validate() error {
+	switch {
+	case cfg.PageSize < 0:
+		return fmt.Errorf("page size must not be negative, got %d", cfg.PageSize)
+	case cfg.RequestsPerSecond < 0:
+		return fmt.Errorf("requests per second must not be negative, got %v", cfg.RequestsPerSecond)
+	case cfg.Timeout < 0:
+		return fmt.Errorf("timeout must not be negative, got %s", cfg.Timeout)
+	}
+	return nil
 }
 
 func cmpOr[T comparable](v, fallback T) T {
@@ -313,6 +336,30 @@ func (v *flexInt) UnmarshalJSON(b []byte) error {
 		return fmt.Errorf("expected an integer, got %s", b)
 	}
 	*v = flexInt(n)
+	return nil
+}
+
+// optInt is a flexInt that remembers whether the field was there at all.
+//
+// The distinction matters exactly once, and expensively: a listing's count
+// decides when pagination stops, so an absent count decoded as zero ends the
+// walk after the first page and reports a truncated directory as a complete
+// one. Nothing downstream can tell the difference.
+type optInt struct {
+	value   int
+	present bool
+}
+
+func (v *optInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(string(b), `"`)
+	if s == "" || s == "null" {
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("expected an integer, got %s", b)
+	}
+	v.value, v.present = n, true
 	return nil
 }
 

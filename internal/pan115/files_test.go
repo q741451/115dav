@@ -110,9 +110,14 @@ func TestListRejectsSubstitutedDirectory(t *testing.T) {
 	}
 }
 
-// A count that overstates what the endpoint will hand over must terminate
-// rather than page forever.
-func TestListStopsOnShortPage(t *testing.T) {
+// A directory the endpoint will not finish serving must be an error, not a
+// short listing. Returning the entries that did arrive would hand a client a
+// truncated directory that looks exactly like a complete small one -- and a
+// media client responds to a library that shrank by discarding what it knew.
+//
+// Terminating at all is the other half of the requirement: a count that
+// overstates what will be served must not page forever.
+func TestListRefusesToTruncate(t *testing.T) {
 	var calls int
 	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -131,11 +136,91 @@ func TestListStopsOnShortPage(t *testing.T) {
 	})
 
 	entries, err := client.List(context.Background(), "0")
+	if err == nil {
+		t.Fatalf("List returned %d of 999 entries and no error", len(entries))
+	}
+	if entries != nil {
+		t.Errorf("List returned %d entries alongside an error; callers must get nothing to cache", len(entries))
+	}
+}
+
+// An absent count is not a count of zero. Decoding it as one would end the
+// walk after the first page, silently losing everything past it.
+func TestListRefusesAPageWithoutACount(t *testing.T) {
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": true, "cid": "0", "offset": 0,
+			"data": []map[string]any{{"fid": "f1", "cid": "0", "n": "one.mkv", "s": "1"}},
+		})
+	})
+
+	if _, err := client.List(context.Background(), "0"); err == nil {
+		t.Fatal("List accepted a page with no count")
+	}
+}
+
+// The shape of a directory 115 has decided not to serve: a count that says
+// there is something there, and nothing in the payload. Reporting it as empty
+// is how a live library turns into a deleted one.
+func TestListRefusesAnEmptyPageBelowTheCount(t *testing.T) {
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": true, "cid": "0", "count": 67, "offset": 0, "data": []any{},
+		})
+	})
+
+	if _, err := client.List(context.Background(), "0"); err == nil {
+		t.Fatal("List reported a 67-entry directory as empty")
+	}
+}
+
+// A genuinely empty directory still lists, and still costs one call.
+func TestListAcceptsAnEmptyDirectory(t *testing.T) {
+	var calls int
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": true, "cid": "7", "count": 0, "offset": 0, "data": []any{},
+		})
+	})
+
+	entries, err := client.List(context.Background(), "7")
 	if err != nil {
 		t.Fatalf("List: %v", err)
 	}
-	if len(entries) != 1 {
-		t.Errorf("got %d entries, want 1", len(entries))
+	if len(entries) != 0 || calls != 1 {
+		t.Errorf("got %d entries in %d calls, want 0 in 1", len(entries), calls)
+	}
+}
+
+// A directory that shrinks between pages is not a contradiction: the count
+// drops with it, and what was already collected is still worth serving.
+func TestListToleratesADirectoryThatShrinks(t *testing.T) {
+	client, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
+		items := []map[string]any{}
+		count := 1500
+		if offset == 0 {
+			for i := range 1000 {
+				items = append(items, map[string]any{
+					"fid": fmt.Sprintf("f%d", i), "cid": "0",
+					"n": fmt.Sprintf("ep%d.mkv", i), "s": "1",
+				})
+			}
+		} else {
+			count = 800 // half the directory was deleted meanwhile
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"state": true, "cid": "0", "count": count, "offset": offset, "data": items,
+		})
+	})
+
+	entries, err := client.List(context.Background(), "0")
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1000 {
+		t.Errorf("got %d entries, want the 1000 that were served", len(entries))
 	}
 }
 

@@ -39,40 +39,69 @@ func (c *Client) CheckAccess(ctx context.Context, cid string) error {
 	return err
 }
 
+// maxListPages bounds the walk so that it terminates whatever 115 reports.
+// At the default page size this is a million entries, which no directory
+// reaches; the cap exists only so that a count which grows faster than the
+// pages are served cannot spin here forever.
+const maxListPages = 1000
+
 // List returns every child of the directory with the given category id.
+//
+// It returns either the whole directory or an error. There is deliberately no
+// third outcome: a partial listing is indistinguishable from a small one, and
+// a media client that receives it concludes the library shrank and discards
+// what it knew. Every way the endpoint can be short is therefore checked
+// rather than accommodated.
 func (c *Client) List(ctx context.Context, cid string) ([]Entry, error) {
 	if cid == "" {
 		cid = RootID
 	}
 
-	var (
-		entries []Entry
-		offset  int
-	)
-	for {
-		page, err := c.listPage(ctx, cid, offset)
+	var entries []Entry
+	for page := 0; page < maxListPages; page++ {
+		got, err := c.listPage(ctx, cid, len(entries))
 		if err != nil {
 			return nil, err
 		}
-
-		// Asking for a directory that does not exist makes 115 quietly serve
-		// the root instead, which would surface as the wrong listing.
-		if got := string(page.CategoryID); got != cid {
-			return nil, fmt.Errorf("%w: asked for %s, got %s", ErrNotFound, cid, got)
+		if err := got.check(cid, len(entries)); err != nil {
+			return nil, err
 		}
 
-		for _, item := range page.Data {
+		for _, item := range got.Data {
 			entries = append(entries, item.entry())
 		}
-
-		// Stop on a short or empty page rather than trusting Count alone: a
-		// count that disagrees with what the endpoint will actually hand over
-		// would otherwise spin here forever.
-		if len(page.Data) == 0 || len(entries) >= page.Count {
+		if len(entries) >= got.Count.value {
 			return entries, nil
 		}
-		offset += len(page.Data)
 	}
+	return nil, fmt.Errorf("list %s: gave up after %d pages", cid, maxListPages)
+}
+
+// check rejects a page that cannot be true.
+//
+// The offset is where this page was expected to start, which is how many
+// entries have been collected so far.
+func (p *listResponse) check(cid string, offset int) error {
+	// Asking for a directory that does not exist makes 115 quietly serve the
+	// root instead, which would surface as the wrong listing.
+	if got := string(p.CategoryID); got != cid {
+		return fmt.Errorf("%w: asked for %s, got %s", ErrNotFound, cid, got)
+	}
+	if !p.Count.present {
+		return fmt.Errorf("list %s: 115 did not say how many entries the directory holds", cid)
+	}
+	if p.Count.value < 0 {
+		return fmt.Errorf("list %s: 115 reported a negative count (%d)", cid, p.Count.value)
+	}
+	// An empty page below the count is the shape both of a directory 115 has
+	// decided not to serve and of a pagination walk that has lost its place.
+	// Either way the entries are missing, and reporting what arrived would
+	// present a truncated directory as a complete one.
+	if len(p.Data) == 0 && offset < p.Count.value {
+		return fmt.Errorf("list %s: 115 says the directory holds %d entries but served none from %d",
+			cid, p.Count.value, offset)
+	}
+	return nil
 }
 
 func (c *Client) listPage(ctx context.Context, cid string, offset int) (*listResponse, error) {
@@ -101,9 +130,11 @@ func (c *Client) listPage(ctx context.Context, cid string, offset int) (*listRes
 type listResponse struct {
 	envelope
 	CategoryID flexString `json:"cid"`
-	Count      int        `json:"count"`
-	Offset     int        `json:"offset"`
-	Data       []listItem `json:"data"`
+	// Count is how many entries the directory holds, and is what decides when
+	// pagination stops -- hence optInt rather than int; see check.
+	Count  optInt     `json:"count"`
+	Offset int        `json:"offset"`
+	Data   []listItem `json:"data"`
 }
 
 func (r *listResponse) status() envelope { return r.envelope }
