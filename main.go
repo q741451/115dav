@@ -194,7 +194,7 @@ func openStatic(opts options, build func(string) (*pan115.Client, error), log *s
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := client.CheckAccess(ctx); err != nil {
+	if err := client.CheckAccess(ctx, opts.root); err != nil {
 		return nil, fmt.Errorf("cannot reach 115: %w", err)
 	}
 	log.Info("115 session accepted", "root", opts.root)

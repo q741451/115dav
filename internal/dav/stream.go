@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -41,6 +42,9 @@ type cachedLink struct {
 // so without a ceiling the map only ever grows.
 const maxCachedLinks = 2048
 
+// resolveTimeout bounds a resolve that no longer has a caller waiting for it.
+const resolveTimeout = time.Minute
+
 func newLinkCache(backend Backend, ttl time.Duration) *linkCache {
 	return &linkCache{backend: backend, ttl: ttl, items: map[string]cachedLink{}}
 }
@@ -55,7 +59,13 @@ func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, e
 		if target := c.lookup(pickCode); target != nil {
 			return target, nil
 		}
-		target, err := c.backend.Resolve(ctx, pickCode)
+		// Detached from the caller for the same reason as a listing: the
+		// resolve is shared, and the request that started it may hang up
+		// while the others are still waiting on it.
+		fetch, cancel := context.WithTimeout(context.WithoutCancel(ctx), resolveTimeout)
+		defer cancel()
+
+		target, err := c.backend.Resolve(fetch, pickCode)
 		if err != nil {
 			return nil, err
 		}
@@ -169,11 +179,33 @@ func (s *streamer) serveHead(w http.ResponseWriter, entry pan115.Entry) {
 	header := w.Header()
 	header.Set("Accept-Ranges", "bytes")
 	header.Set("Content-Length", strconv.FormatInt(entry.Size, 10))
+	setIdentity(header, entry)
+	w.WriteHeader(http.StatusOK)
+}
+
+// setIdentity applies the metadata that must be the same however the file was
+// asked about. The CDN answers with its own ETag and its own idea of the
+// modification time, both different from what PROPFIND reported for the same
+// file; a client that saw one and then the other has no way to tell it is
+// looking at the same thing.
+func setIdentity(header http.Header, entry pan115.Entry) {
 	header.Set("Content-Type", contentType(entry.Name))
+	header.Set("ETag", entryTag(entry))
 	if !entry.ModTime.IsZero() {
 		header.Set("Last-Modified", entry.ModTime.UTC().Format(http.TimeFormat))
 	}
-	w.WriteHeader(http.StatusOK)
+}
+
+// entryTag is the same value fileInfo.ETag reports through PROPFIND.
+func entryTag(entry pan115.Entry) string {
+	if entry.SHA1 != "" {
+		return strconv.Quote("sha1:" + entry.SHA1)
+	}
+	modTime := entry.ModTime
+	if modTime.IsZero() {
+		modTime = time.Unix(0, 0)
+	}
+	return fmt.Sprintf(`"%x%x"`, modTime.UnixNano(), entry.Size)
 }
 
 // serveGet streams the file, forwarding the client's range request upstream.
@@ -225,8 +257,8 @@ func (c *clientWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// open resolves the file and performs the upstream request, retrying once with
-// a freshly resolved URL if the CDN rejects the cached one.
+// open resolves the file and performs the upstream request, retrying once if
+// the CDN rejects the cached URL or the connection fails outright.
 func (s *streamer) open(r *http.Request, entry pan115.Entry) (*http.Response, error) {
 	var lastErr error
 	for attempt := range 2 {
@@ -235,26 +267,54 @@ func (s *streamer) open(r *http.Request, entry pan115.Entry) (*http.Response, er
 			return nil, err
 		}
 
-		resp, err := s.fetch(r, target)
-		if err != nil {
-			return nil, err
-		}
-		if !isExpired(resp.StatusCode) {
+		resp, err := s.fetch(r, entry, target)
+		switch {
+		case err != nil:
+			// The connection failed before any answer arrived. Nothing has
+			// reached the client yet and a GET changes nothing upstream, so
+			// trying again costs a round trip and saves a failed playback --
+			// a home uplink drops connections for a living. The cached URL is
+			// kept: it is the connection that failed, not the link.
+			if r.Context().Err() != nil {
+				return nil, err
+			}
+			lastErr = err
+			if attempt == 0 {
+				s.log.Debug("upstream connection failed, trying once more",
+					"file", entry.Name, "err", err)
+			}
+		case !isExpired(resp.StatusCode):
 			return resp, nil
-		}
-
-		resp.Body.Close()
-		lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name}
-		s.links.forget(entry.PickCode)
-		if attempt == 0 {
-			s.log.Debug("download link rejected, resolving again",
-				"file", entry.Name, "status", resp.StatusCode)
+		default:
+			resp.Body.Close()
+			lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name}
+			s.links.forget(entry.PickCode)
+			if attempt == 0 {
+				s.log.Debug("download link rejected, resolving again",
+					"file", entry.Name, "status", resp.StatusCode)
+			}
 		}
 	}
 	return nil, lastErr
 }
 
-func (s *streamer) fetch(r *http.Request, target *pan115.Target) (*http.Response, error) {
+// rangeStillApplies evaluates If-Range against what we told the client this
+// file was. A mismatch means the client is holding a stale copy, so it gets
+// the whole file rather than a range spliced onto something else.
+func rangeStillApplies(r *http.Request, entry pan115.Entry) bool {
+	condition := strings.TrimSpace(r.Header.Get("If-Range"))
+	if condition == "" {
+		return true
+	}
+	if strings.HasPrefix(condition, `"`) || strings.HasPrefix(condition, "W/") {
+		return strings.TrimPrefix(condition, "W/") == entryTag(entry)
+	}
+	// The other permitted form is a date, which must match exactly.
+	stamp, err := http.ParseTime(condition)
+	return err == nil && !entry.ModTime.IsZero() && stamp.Equal(entry.ModTime.UTC().Truncate(time.Second))
+}
+
+func (s *streamer) fetch(r *http.Request, entry pan115.Entry, target *pan115.Target) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.URL, nil)
 	if err != nil {
 		return nil, err
@@ -262,18 +322,24 @@ func (s *streamer) fetch(r *http.Request, target *pan115.Target) (*http.Response
 	req.Header = target.Header.Clone()
 	// Seeking is the whole point: hand the range straight through and let the
 	// CDN answer it, rather than reconstructing it locally.
-	for _, name := range []string{"Range", "If-Range"} {
-		if value := r.Header.Get(name); value != "" {
-			req.Header.Set(name, value)
-		}
+	//
+	// If-Range cannot be forwarded, because the validator in it is ours and
+	// means nothing to the CDN, which would answer the whole file. It is
+	// answered here instead: the condition holds when the file is unchanged,
+	// and a 115 file's content hash cannot change without the entry changing.
+	if value := r.Header.Get("Range"); value != "" && rangeStillApplies(r, entry) {
+		req.Header.Set("Range", value)
 	}
 	return s.client.Do(req)
 }
 
 func (s *streamer) fail(w http.ResponseWriter, r *http.Request, entry pan115.Entry, err error) {
 	// A cancelled request context is how a client hanging up reaches us, and
-	// is nothing to report.
-	if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+	// is nothing to report. Only this request's own context counts: a
+	// cancellation carried in err may have come from another caller that
+	// shared the work, and answering that with silence would leave a client
+	// that is still waiting holding an empty 200.
+	if r.Context().Err() != nil {
 		return
 	}
 	if !errors.Is(err, ErrUnavailable) {
@@ -310,14 +376,14 @@ func isExpired(status int) bool {
 	return false
 }
 
-// passthroughHeaders are copied from the CDN response as-is. Everything else,
-// notably Set-Cookie and any 115 session state, is dropped.
+// passthroughHeaders are copied from the CDN response as-is: they describe
+// this transfer, which only the CDN knows about. Everything that describes the
+// file itself comes from the listing instead, so that it matches what PROPFIND
+// said. Everything else, notably Set-Cookie and any 115 session state, is
+// dropped.
 var passthroughHeaders = []string{
 	"Content-Length",
 	"Content-Range",
-	"Accept-Ranges",
-	"Last-Modified",
-	"ETag",
 }
 
 func copyResponseHeaders(dst, src http.Header, entry pan115.Entry) {
@@ -327,15 +393,14 @@ func copyResponseHeaders(dst, src http.Header, entry pan115.Entry) {
 		}
 	}
 	dst.Set("Accept-Ranges", "bytes")
+	setIdentity(dst, entry)
 
-	// Prefer our own guess: the CDN labels nearly everything as a generic
-	// binary stream, which makes players fall back to sniffing.
-	if guess := contentType(entry.Name); guess != defaultContentType {
-		dst.Set("Content-Type", guess)
-	} else if value := src.Get("Content-Type"); value != "" {
-		dst.Set("Content-Type", value)
-	} else {
-		dst.Set("Content-Type", defaultContentType)
+	// The CDN labels nearly everything as a generic binary stream, so our own
+	// guess is used above; fall back to its label only when we have none.
+	if contentType(entry.Name) == defaultContentType {
+		if value := src.Get("Content-Type"); value != "" {
+			dst.Set("Content-Type", value)
+		}
 	}
 }
 

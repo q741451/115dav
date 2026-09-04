@@ -27,12 +27,15 @@ type Entry struct {
 // RootID is the category id of the account's top-level directory.
 const RootID = "0"
 
-// CheckAccess confirms the cookie is usable by listing the root directory.
+// CheckAccess confirms the cookie is usable by listing the directory that is
+// about to be served. An empty cid means the account root.
 //
-// This doubles as a smoke test of the exact code path used in anger, which is
-// worth more at startup than a dedicated session endpoint would be.
-func (c *Client) CheckAccess(ctx context.Context) error {
-	_, err := c.List(ctx, RootID)
+// Listing is also what will be done in anger, so this doubles as a smoke test
+// of the exact code path -- worth more at startup than a dedicated session
+// endpoint would be. Checking the mount point rather than the account root
+// additionally catches a directory id that does not exist.
+func (c *Client) CheckAccess(ctx context.Context, cid string) error {
+	_, err := c.List(ctx, cid)
 	return err
 }
 

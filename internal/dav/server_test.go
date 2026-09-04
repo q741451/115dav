@@ -32,11 +32,14 @@ type fakeBackend struct {
 	// backend has handed out so far.
 	generation atomic.Int64
 
-	listErr      atomic.Pointer[error]
-	listCalls    atomic.Int64
-	resolveCalls atomic.Int64
-	fetches      atomic.Int64
-	rejections   atomic.Int64
+	listErr       atomic.Pointer[error]
+	dropOnce      atomic.Bool
+	beforeList    func()
+	beforeResolve func()
+	listCalls     atomic.Int64
+	resolveCalls  atomic.Int64
+	fetches       atomic.Int64
+	rejections    atomic.Int64
 }
 
 const (
@@ -51,6 +54,15 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 	b.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b.fetches.Add(1)
+
+		// Drop the connection without answering, the way a flaky uplink does.
+		if b.dropOnce.CompareAndSwap(true, false) {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+			return
+		}
 
 		// The CDN checks the identity that asked for the URL; so do we, since
 		// getting that wrong is the failure this whole design exists to avoid.
@@ -77,8 +89,16 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 	return b
 }
 
-func (b *fakeBackend) List(_ context.Context, id string) ([]pan115.Entry, error) {
+func (b *fakeBackend) List(ctx context.Context, id string) ([]pan115.Entry, error) {
 	b.listCalls.Add(1)
+	if b.beforeList != nil {
+		b.beforeList()
+	}
+	// A real client aborts when its context is cancelled; a fake that ignores
+	// the context cannot show what sharing one between callers costs.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := b.listErr.Load(); err != nil {
 		return nil, *err
 	}
@@ -93,8 +113,14 @@ func (b *fakeBackend) List(_ context.Context, id string) ([]pan115.Entry, error)
 // login or a dead network reaches the WebDAV layer.
 func (b *fakeBackend) failListings(err error) { b.listErr.Store(&err) }
 
-func (b *fakeBackend) Resolve(_ context.Context, pickCode string) (*pan115.Target, error) {
+func (b *fakeBackend) Resolve(ctx context.Context, pickCode string) (*pan115.Target, error) {
 	b.resolveCalls.Add(1)
+	if b.beforeResolve != nil {
+		b.beforeResolve()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if _, ok := b.blobs[pickCode]; !ok {
 		return nil, &pan115.ErrNotDownloadable{PickCode: pickCode}
 	}
@@ -611,5 +637,103 @@ func TestFlushDropsEveryCache(t *testing.T) {
 	}
 	if b.resolveCalls.Load() <= resolved {
 		t.Error("the link cache survived a flush")
+	}
+}
+
+// A file must look like the same file however it was asked about. The CDN
+// answers with its own ETag and its own modification time; if those reached
+// the client it would see one identity through PROPFIND and another through
+// GET, and could not tell whether its cached copy was still good.
+func TestFileIdentityIsConsistentAcrossMethods(t *testing.T) {
+	srv := newTestServer(t, sample(t), Options{})
+
+	head := do(t, srv, http.MethodHead, "/film.mkv", nil)
+	get := do(t, srv, http.MethodGet, "/film.mkv", map[string]string{"Range": "bytes=0-9"})
+	propfind := body(t, do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}))
+
+	wantTag := `"sha1:abc123"`
+	for name, resp := range map[string]*http.Response{"HEAD": head, "GET": get} {
+		if got := resp.Header.Get("ETag"); got != wantTag {
+			t.Errorf("%s ETag = %q, want %q", name, got, wantTag)
+		}
+		if got := resp.Header.Get("Last-Modified"); got != head.Header.Get("Last-Modified") {
+			t.Errorf("%s Last-Modified = %q, want %q", name, got, head.Header.Get("Last-Modified"))
+		}
+		if got := resp.Header.Get("Content-Type"); got != "video/x-matroska" {
+			t.Errorf("%s Content-Type = %q, want video/x-matroska", name, got)
+		}
+	}
+	if !strings.Contains(propfind, "sha1:abc123") {
+		t.Errorf("PROPFIND reports a different identity:\n%s", propfind)
+	}
+}
+
+// If-Range names a validator only this server has issued, so it is answered
+// here: forwarded upstream it would mean nothing to the CDN, which would
+// answer with the whole file just as the client seeked.
+func TestIfRangeIsAnsweredLocally(t *testing.T) {
+	for name, tc := range map[string]struct {
+		ifRange    string
+		wantStatus int
+	}{
+		"matching etag": {`"sha1:abc123"`, http.StatusPartialContent},
+		"weak etag":     {`W/"sha1:abc123"`, http.StatusPartialContent},
+		"stale etag":    {`"sha1:something-else"`, http.StatusOK},
+		"stale date":    {"Mon, 02 Jan 2006 15:04:05 GMT", http.StatusOK},
+		"absent":        {"", http.StatusPartialContent},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := sample(t)
+			srv := newTestServer(t, b, Options{})
+			headers := map[string]string{"Range": "bytes=0-99"}
+			if tc.ifRange != "" {
+				headers["If-Range"] = tc.ifRange
+			}
+
+			resp := do(t, srv, http.MethodGet, "/film.mkv", headers)
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+			if got := len(body(t, resp)); tc.wantStatus == http.StatusOK && got != len(b.blobs["pc-film"]) {
+				t.Errorf("served %d bytes, want the whole file (%d)", got, len(b.blobs["pc-film"]))
+			}
+		})
+	}
+}
+
+// A connection that dies before the CDN answers is worth one more try: nothing
+// has reached the client yet, and a dropped connection is not a dead link.
+func TestUpstreamConnectionFailureIsRetried(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{})
+	b.dropOnce.Store(true)
+
+	resp := do(t, srv, http.MethodGet, "/film.mkv", map[string]string{"Range": "bytes=0-99"})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206 after one retry", resp.StatusCode)
+	}
+	if got := len(body(t, resp)); got != 100 {
+		t.Errorf("served %d bytes, want 100", got)
+	}
+	if n := b.fetches.Load(); n != 2 {
+		t.Errorf("fetched %d times, want 2 -- one failure and one retry", n)
+	}
+	if n := b.resolveCalls.Load(); n != 1 {
+		t.Errorf("resolved %d times, want 1 -- the link was fine, the connection was not", n)
+	}
+}
+
+// Two failures in a row is upstream being genuinely broken, and the client is
+// told so rather than being made to wait through further attempts.
+func TestUpstreamFailureIsReportedAfterOneRetry(t *testing.T) {
+	b := newFakeBackend(t)
+	b.blobs["pc-gone"] = []byte("x")
+	b.dirs["0"] = []pan115.Entry{{ID: "f1", Name: "gone.mkv", Size: 1, PickCode: "pc-gone"}}
+	srv := newTestServer(t, b, Options{})
+	b.origin.Close() // upstream is down for good
+
+	resp := do(t, srv, http.MethodGet, "/gone.mkv", nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", resp.StatusCode)
 	}
 }

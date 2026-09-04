@@ -214,3 +214,25 @@ func TestServerURLIsNormalised(t *testing.T) {
 		t.Errorf("Server() = %q, want http://host:2500", got)
 	}
 }
+
+// A redirect must not carry the channel key to wherever it points: net/http
+// strips only the headers it knows are sensitive, and this one is ours.
+func TestFetchDoesNotFollowRedirects(t *testing.T) {
+	var leaked string
+	elsewhere := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("X-Channel-Key")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "cookies": []map[string]any{{"name": "UID", "value": "stolen"}}})
+	}))
+	t.Cleanup(elsewhere.Close)
+
+	client := stub(t, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, elsewhere.URL+"/api/download?domain=115.com", http.StatusFound)
+	})
+
+	if _, err := client.Fetch(context.Background()); err == nil {
+		t.Error("followed the redirect and accepted its answer")
+	}
+	if leaked != "" {
+		t.Errorf("the channel key was sent to the redirect target (%q)", leaked)
+	}
+}

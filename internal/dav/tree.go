@@ -43,17 +43,32 @@ type Tree struct {
 	ttl     time.Duration
 
 	group singleflight.Group
-	mu    sync.Mutex
-	dirs  map[string]*directory
+
+	mu      sync.Mutex
+	dirs    map[string]*directory
+	entries int // total across dirs, kept in step with the map below
 }
 
-// maxCachedDirs bounds memory on large accounts. Reaching it triggers a sweep
-// of expired entries before anything live is dropped.
-const maxCachedDirs = 4096
+// Bounds on the cache. Directory count alone says nothing about memory: a
+// library scan walks thousands of directories in minutes, and it is the
+// entries inside them that occupy the space. At roughly 200 bytes an entry
+// the ceiling below is on the order of ten megabytes, which is affordable on
+// the routers this is built for.
+const (
+	maxCachedDirs    = 4096
+	maxCachedEntries = 60000
+
+	// listTimeout bounds a listing that no longer has a caller waiting for
+	// it. Paginating a very large directory against the rate limit is slow,
+	// so it is generous.
+	listTimeout = 2 * time.Minute
+)
 
 type directory struct {
 	entries []pan115.Entry
-	byName  map[string]pan115.Entry
+	// byName indexes into entries rather than copying them: a second copy of
+	// every entry would double what a cached listing costs.
+	byName  map[string]int
 	expires time.Time
 }
 
@@ -87,11 +102,11 @@ func (t *Tree) Lookup(ctx context.Context, name string) (pan115.Entry, error) {
 		if err != nil {
 			return pan115.Entry{}, err
 		}
-		child, ok := dir.byName[segment]
+		i, ok := dir.byName[segment]
 		if !ok {
 			return pan115.Entry{}, fs.ErrNotExist
 		}
-		current = child
+		current = dir.entries[i]
 	}
 	return current, nil
 }
@@ -115,7 +130,14 @@ func (t *Tree) children(ctx context.Context, id string) (*directory, error) {
 		if dir := t.cached(id); dir != nil {
 			return dir, nil
 		}
-		entries, err := t.backend.List(ctx, id)
+		// The listing is shared with everyone else waiting on this id, so it
+		// must not be tied to whichever request happened to start it: that
+		// caller may hang up -- players do, constantly -- and the rest would
+		// inherit its cancellation.
+		fetch, cancel := context.WithTimeout(context.WithoutCancel(ctx), listTimeout)
+		defer cancel()
+
+		entries, err := t.backend.List(fetch, id)
 		if err != nil {
 			return nil, err
 		}
@@ -141,24 +163,45 @@ func (t *Tree) cached(id string) *directory {
 func (t *Tree) store(id string, dir *directory) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if len(t.dirs) >= maxCachedDirs {
-		t.sweepLocked()
+	if previous, ok := t.dirs[id]; ok {
+		t.entries -= len(previous.entries)
 	}
 	t.dirs[id] = dir
+	t.entries += len(dir.entries)
+	if t.overLimitLocked() {
+		t.sweepLocked(id)
+	}
 }
 
-// sweepLocked drops expired listings, and failing that the whole cache. A
-// media library is walked in bursts, so a cold cache costs one rescan rather
-// than the steady thrash a strict LRU would need bookkeeping to avoid.
-func (t *Tree) sweepLocked() {
+func (t *Tree) overLimitLocked() bool {
+	return len(t.dirs) > maxCachedDirs || t.entries > maxCachedEntries
+}
+
+// sweepLocked drops expired listings, and failing that everything except the
+// directory just stored -- which is the one being read right now. A media
+// library is walked in bursts, so a cold cache costs one rescan rather than
+// the steady thrash a strict LRU would need bookkeeping to avoid.
+func (t *Tree) sweepLocked(keep string) {
 	now := time.Now()
 	for id, dir := range t.dirs {
 		if now.After(dir.expires) {
 			delete(t.dirs, id)
+			t.entries -= len(dir.entries)
 		}
 	}
-	if len(t.dirs) >= maxCachedDirs {
-		clear(t.dirs)
+	if !t.overLimitLocked() {
+		return
+	}
+
+	kept := t.dirs[keep]
+	clear(t.dirs)
+	t.entries = 0
+	if kept != nil {
+		// A single directory larger than the whole budget is still worth
+		// keeping: it is already in memory, and dropping it would mean
+		// listing it again on the very next request.
+		t.dirs[keep] = kept
+		t.entries = len(kept.entries)
 	}
 }
 
@@ -168,13 +211,17 @@ func (t *Tree) Clear() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	clear(t.dirs)
+	t.entries = 0
 }
 
 // Forget drops any cached listing for a directory.
 func (t *Tree) Forget(id string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	delete(t.dirs, id)
+	if dir, ok := t.dirs[id]; ok {
+		t.entries -= len(dir.entries)
+		delete(t.dirs, id)
+	}
 }
 
 // newDirectory indexes a listing by name, making the names unique and safe to
@@ -182,13 +229,13 @@ func (t *Tree) Forget(id string) {
 func newDirectory(entries []pan115.Entry, expires time.Time) *directory {
 	dir := &directory{
 		entries: make([]pan115.Entry, 0, len(entries)),
-		byName:  make(map[string]pan115.Entry, len(entries)),
+		byName:  make(map[string]int, len(entries)),
 		expires: expires,
 	}
 	for _, entry := range entries {
 		entry.Name = uniqueName(dir.byName, sanitiseName(entry.Name))
+		dir.byName[entry.Name] = len(dir.entries)
 		dir.entries = append(dir.entries, entry)
-		dir.byName[entry.Name] = entry
 	}
 	return dir
 }
@@ -211,7 +258,7 @@ func sanitiseName(name string) string {
 
 // uniqueName suffixes duplicates, keeping the extension last so media scanners
 // still recognise the format.
-func uniqueName(taken map[string]pan115.Entry, name string) string {
+func uniqueName(taken map[string]int, name string) string {
 	if _, clash := taken[name]; !clash {
 		return name
 	}

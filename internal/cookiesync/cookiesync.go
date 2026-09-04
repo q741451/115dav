@@ -83,6 +83,13 @@ func New(cfg Config) (*Client, error) {
 	return &Client{
 		http: &http.Client{
 			Timeout: timeout,
+			// Do not follow redirects. The channel key travels in a header of
+			// our own, and net/http only strips the headers it knows are
+			// sensitive when a redirect crosses hosts -- this one it would
+			// happily hand to wherever the server pointed us.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				// No connection reuse. Fetches are rare -- once at startup and

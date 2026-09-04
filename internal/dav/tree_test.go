@@ -92,12 +92,12 @@ func TestDuplicateNamesAreDisambiguated(t *testing.T) {
 
 	// Every entry must still be reachable by its displayed name.
 	for _, entry := range dir.entries {
-		found, ok := dir.byName[entry.Name]
+		i, ok := dir.byName[entry.Name]
 		if !ok {
 			t.Errorf("%q is not resolvable", entry.Name)
 			continue
 		}
-		if found.ID != entry.ID {
+		if found := dir.entries[i]; found.ID != entry.ID {
 			t.Errorf("%q resolves to id %s, want %s", entry.Name, found.ID, entry.ID)
 		}
 	}

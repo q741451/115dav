@@ -51,6 +51,9 @@ type Options struct {
 	Logger *slog.Logger
 }
 
+// fetchTimeout bounds a cookie fetch that no longer has a caller waiting.
+const fetchTimeout = 30 * time.Second
+
 // DefaultBlackout is long enough that a person noticing the failure, logging
 // in again and re-uploading is not racing a stream of retries.
 const DefaultBlackout = 30 * time.Second
@@ -135,7 +138,13 @@ func withRefresh[T any](s *Session, ctx context.Context, op func(*pan115.Client)
 		if err := s.refresh(ctx, ""); err != nil {
 			return zero, err
 		}
-		client = s.client.Load()
+		if client = s.client.Load(); client == nil {
+			// Belt and braces: a refresh that reports success has stored a
+			// client, but this is a long-lived process on an unattended box
+			// and a nil dereference here would be a poor way to find out
+			// otherwise.
+			return zero, dav.ErrUnavailable
+		}
 	}
 
 	result, err := op(client)
@@ -168,7 +177,12 @@ func (s *Session) refresh(ctx context.Context, stale string) error {
 			return nil, nil
 		}
 
-		cookie, err := s.opts.Source.Fetch(ctx)
+		// Detached from the caller: the fetch is shared with everyone else
+		// waiting on it, and the request that triggered it may hang up.
+		fetch, cancel := context.WithTimeout(context.WithoutCancel(ctx), fetchTimeout)
+		defer cancel()
+
+		cookie, err := s.opts.Source.Fetch(fetch)
 		switch {
 		case errors.Is(err, cookiesync.ErrRejected), errors.Is(err, cookiesync.ErrNoDomain):
 			// The configuration is wrong and will not repair itself. Loud, but

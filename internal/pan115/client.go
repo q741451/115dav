@@ -33,10 +33,11 @@ const (
 	// maxPageSize is the largest page the listing endpoint will serve.
 	maxPageSize = 1150
 
-	// maxAPIBody caps how much of an API response we will read. Listings of a
-	// full page run to a few hundred KB; anything past this is a captive
-	// portal or an error page, not JSON we want to buffer.
-	maxAPIBody = 32 << 20
+	// maxAPIBody caps how much of an API response we will read. A full page
+	// of 1150 entries runs to a few hundred KB, so this leaves an order of
+	// magnitude of headroom while keeping a single bad response from
+	// allocating more than a router has to spare.
+	maxAPIBody = 8 << 20
 )
 
 // Config describes how to talk to 115.
