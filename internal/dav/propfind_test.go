@@ -256,3 +256,50 @@ func TestInvalidDepthIsRejected(t *testing.T) {
 		t.Errorf("status = %d, want 400", resp.StatusCode)
 	}
 }
+
+// The mount makes three statements about locking, and they have to agree.
+// OPTIONS advertises DAV class 1, which does not include locking; LOCK is
+// refused; so supportedlock cannot claim an exclusive write lock. It used to,
+// inherited from a library that had a working lock system behind it, and a
+// client acting on that claim would have been told 405 by the same server.
+//
+// Empty is a statement, not an omission: RFC 4918 reads an empty
+// supportedlock as "no lock type is supported", which is the truth here.
+func TestLockingIsRefusedConsistently(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{})
+
+	page := body(t, do(t, srv, "PROPFIND", "/film.mkv", map[string]string{"Depth": "0"}))
+	if !strings.Contains(page, "<D:supportedlock/>") {
+		t.Errorf("supportedlock is not empty:\n%s", page)
+	}
+	if strings.Contains(page, "lockentry") || strings.Contains(page, "exclusive") {
+		t.Errorf("the mount advertises a lock it will not grant:\n%s", page)
+	}
+
+	options := do(t, srv, http.MethodOptions, "/", nil)
+	if got := options.Header.Get("DAV"); got != "1" {
+		t.Errorf("DAV header = %q, want 1 -- class 2 would be the one that includes locking", got)
+	}
+
+	if resp := do(t, srv, "LOCK", "/film.mkv", nil); resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Errorf("LOCK = %d, want 405", resp.StatusCode)
+	}
+}
+
+// One Content-Type for every XML body. The multistatus and the error bodies
+// used to disagree, which is the sort of difference that is nobody's decision
+// and survives because nothing looks at both at once.
+func TestEveryXMLBodyIsLabelledTheSame(t *testing.T) {
+	b := sample(t)
+	srv := newTestServer(t, b, Options{})
+
+	for name, resp := range map[string]*http.Response{
+		"multistatus":  do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "1"}),
+		"finite depth": do(t, srv, "PROPFIND", "/", map[string]string{"Depth": "infinity"}),
+	} {
+		if got := resp.Header.Get("Content-Type"); got != xmlContentType {
+			t.Errorf("%s carried Content-Type %q, want %q", name, got, xmlContentType)
+		}
+	}
+}

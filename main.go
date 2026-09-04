@@ -331,7 +331,17 @@ func parseFlags() options {
 	flag.StringVar(&opts.root, "root", pan115.RootID, "115 directory id to mount")
 	flag.StringVar(&opts.username, "user", os.Getenv("PAN115_USER"), "username for HTTP basic auth (optional)")
 	flag.StringVar(&opts.password, "pass", os.Getenv("PAN115_PASS"), "password for HTTP basic auth (optional)")
-	flag.DurationVar(&opts.dirTTL, "dir-ttl", 5*time.Minute, "how long to cache directory listings")
+	// 30 seconds, not minutes: the common case is uploading a file and wanting
+	// to watch it, and waiting five minutes for the mount to admit it exists is
+	// the wrong default for that. The cost is one listing per directory being
+	// browsed every 30 seconds -- twenty open directories is 0.7 requests a
+	// second against a budget of two.
+	//
+	// Nothing worse than a re-listing is risked by lowering it. A PROPFIND
+	// resolves everything it will report before it writes any of it, so a
+	// listing cannot now expire midway through a response and take entries
+	// with it; see propfind.go.
+	flag.DurationVar(&opts.dirTTL, "dir-ttl", 30*time.Second, "how long to cache directory listings")
 	flag.DurationVar(&opts.linkTTL, "link-ttl", 2*time.Hour, "how long to reuse a download URL before resolving again")
 	flag.Float64Var(&opts.rate, "rate", pan115.DefaultRate, "requests per second allowed against the 115 API")
 	flag.IntVar(&opts.pageSize, "page-size", pan115.DefaultPageSize, "directory listing page size (max 1150)")

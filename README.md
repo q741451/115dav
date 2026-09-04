@@ -69,7 +69,7 @@ PAN115_COOKIE='UID=...; CID=...; SEID=...' 115dav
 | `-cookie` / `-cookie-file` | — | 115 cookie，也可用 `PAN115_COOKIE` |
 | `-user` / `-pass` | 空 | HTTP Basic 认证，也可用 `PAN115_USER` / `PAN115_PASS` |
 | `-root` | `0` | 只挂某个子目录时填它的 115 目录 id |
-| `-dir-ttl` | `5m` | 目录列表缓存时长 |
+| `-dir-ttl` | `30s` | 目录列表缓存时长 |
 | `-link-ttl` | `2h` | 直链复用时长 |
 | `-rate` | `2` | 115 API 每秒请求数上限（不限制读文件） |
 | `-page-size` | `1000` | 列目录分页大小，上限 1150 |

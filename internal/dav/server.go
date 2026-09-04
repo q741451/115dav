@@ -123,7 +123,7 @@ func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
 		// per directory, for as long as that takes. Clients are expected to
 		// handle this and ask again with a depth.
 		s.log.Warn("refused an unbounded PROPFIND", "path", r.URL.Path, "agent", r.UserAgent())
-		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Content-Type", xmlContentType)
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, xml.Header+`<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`)
 		return
@@ -151,17 +151,21 @@ func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// text/xml rather than application/xml, which is what this mount has always
-	// answered with and what some older clients look for. RFC 4918 permits
-	// either; the error responses above still use application/xml, an
-	// inconsistency inherited rather than introduced here.
-	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.Header().Set("Content-Type", xmlContentType)
 	w.WriteHeader(http.StatusMultiStatus)
 	if err := writeMultistatus(w, snap, req); err != nil {
 		// Only the client going away can get here; the body was already built.
 		s.log.Debug("propfind write failed", "path", r.URL.Path, "err", err)
 	}
 }
+
+// xmlContentType labels every XML body this server sends.
+//
+// text/xml rather than application/xml: RFC 4918 permits either, this is what
+// the multistatus has always carried, and some older clients look for it. The
+// point is that there is one answer -- the error bodies used to disagree with
+// the multistatus for no reason anybody chose.
+const xmlContentType = "text/xml; charset=utf-8"
 
 // Depth values, matching what x/net/webdav accepts. A missing header means
 // infinity, per RFC 4918.

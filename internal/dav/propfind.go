@@ -117,10 +117,16 @@ var liveProps = []liveProperty{
 		return entryTag(e)
 	}},
 	{name: "supportedlock", onDir: true, raw: true, value: func(pan115.Entry) string {
-		// Reported for the clients that refuse to mount without it. LOCK
-		// itself is answered 405; see allowedMethods.
-		return `<D:lockentry><D:lockscope><D:exclusive/></D:lockscope>` +
-			`<D:locktype><D:write/></D:locktype></D:lockentry>`
+		// Empty: no lock type is supported, which is what RFC 4918 says an
+		// empty supportedlock means and what is actually true here. LOCK is
+		// answered 405, and OPTIONS advertises DAV class 1, which does not
+		// include locking -- so the exclusive write lock this used to claim
+		// contradicted both.
+		//
+		// The property is still reported rather than omitted. It is a live
+		// property, and answering "none" is a different statement from having
+		// no answer.
+		return ""
 	}},
 }
 
