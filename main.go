@@ -34,7 +34,6 @@ var version = "dev"
 type options struct {
 	listen      string
 	cookie      string
-	cookieFile  string
 	root        string
 	username    string
 	password    string
@@ -51,7 +50,6 @@ type options struct {
 	cookieServer  string
 	cookieChannel string
 	cookieKey     string
-	cookieKeyFile string
 	cookieDomain  string
 	cookieRetry   time.Duration
 }
@@ -185,8 +183,8 @@ func serve(server *http.Server, log *slog.Logger, opts options) error {
 	return nil
 }
 
-// openStatic builds a client from a cookie given on the command line, in a
-// file, or in the environment.
+// openStatic builds a client from a cookie given on the command line or in the
+// environment.
 //
 // The cookie is checked against 115 before serving starts: it cannot be
 // replaced without a restart, so a bad one is worth failing on immediately.
@@ -294,22 +292,18 @@ func (s subscribed) Backend(ctx context.Context) (dav.Backend, error) {
 
 func (s subscribed) Reject(backend dav.Backend) { s.Session.Reject(backend) }
 
-// readCookieKey takes the channel key from whichever source was configured.
+// readCookieKey takes the channel key from the flag or the environment.
+//
+// The environment is there because a flag is visible to every user on the box
+// through ps, and a channel key is a secret.
 func readCookieKey(opts options) (string, error) {
-	if opts.cookieKeyFile != "" {
-		raw, err := os.ReadFile(opts.cookieKeyFile)
-		if err != nil {
-			return "", fmt.Errorf("read cookie key file: %w", err)
-		}
-		return strings.TrimSpace(string(raw)), nil
-	}
 	if opts.cookieKey != "" {
 		return opts.cookieKey, nil
 	}
 	if env := os.Getenv("PAN115_COOKIE_KEY"); env != "" {
 		return env, nil
 	}
-	return "", errors.New("no channel key given: pass -cookie-key, -cookie-key-file, or set PAN115_COOKIE_KEY")
+	return "", errors.New("no channel key given: pass -cookie-key or set PAN115_COOKIE_KEY")
 }
 
 func mountHints(addr net.Addr, opts options) []string {
@@ -331,7 +325,6 @@ func parseFlags() options {
 	var opts options
 	flag.StringVar(&opts.listen, "listen", ":8115", "address to listen on")
 	flag.StringVar(&opts.cookie, "cookie", "", "115 cookie (UID=..; CID=..; SEID=..; KID=..), or set PAN115_COOKIE")
-	flag.StringVar(&opts.cookieFile, "cookie-file", "", "read the cookie from this file instead")
 	flag.StringVar(&opts.root, "root", pan115.RootID, "115 directory id to mount")
 	flag.StringVar(&opts.username, "user", os.Getenv("PAN115_USER"), "username for HTTP basic auth (optional)")
 	flag.StringVar(&opts.password, "pass", os.Getenv("PAN115_PASS"), "password for HTTP basic auth (optional)")
@@ -357,7 +350,6 @@ func parseFlags() options {
 		"read the cookie from a cookie-sync server instead, e.g. https://sync.example.com")
 	flag.StringVar(&opts.cookieChannel, "cookie-channel", os.Getenv("PAN115_COOKIE_CHANNEL"), "channel name on that server")
 	flag.StringVar(&opts.cookieKey, "cookie-key", "", "channel key, or set PAN115_COOKIE_KEY")
-	flag.StringVar(&opts.cookieKeyFile, "cookie-key-file", "", "read the channel key from this file instead")
 	flag.StringVar(&opts.cookieDomain, "cookie-domain", cmpOr(os.Getenv("PAN115_COOKIE_DOMAIN"), "115.com"),
 		"which domain to read inside the channel")
 	flag.DurationVar(&opts.cookieRetry, "cookie-retry", session.DefaultBlackout,
@@ -391,9 +383,6 @@ func checkModes(opts options) error {
 	if opts.cookie != "" {
 		given = append(given, "-cookie")
 	}
-	if opts.cookieFile != "" {
-		given = append(given, "-cookie-file")
-	}
 	if os.Getenv("PAN115_COOKIE") != "" {
 		given = append(given, "PAN115_COOKIE")
 	}
@@ -425,21 +414,16 @@ func checkLimits(opts options) error {
 	return nil
 }
 
-// readCookie takes the cookie from whichever source was configured, preferring
-// the file so that a long secret need not sit in the process arguments.
+// readCookie takes the cookie from the flag or the environment.
+//
+// The environment is there because a flag is visible to every user on the box
+// through ps, and a 115 cookie is the whole account.
 func readCookie(opts options) (string, error) {
-	if opts.cookieFile != "" {
-		raw, err := os.ReadFile(opts.cookieFile)
-		if err != nil {
-			return "", fmt.Errorf("read cookie file: %w", err)
-		}
-		return strings.TrimSpace(string(raw)), nil
-	}
 	if opts.cookie != "" {
 		return opts.cookie, nil
 	}
 	if env := os.Getenv("PAN115_COOKIE"); env != "" {
 		return env, nil
 	}
-	return "", errors.New("no cookie given: pass -cookie, -cookie-file, or set PAN115_COOKIE")
+	return "", errors.New("no cookie given: pass -cookie or set PAN115_COOKIE")
 }

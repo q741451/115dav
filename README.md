@@ -22,11 +22,10 @@
 
 少了 `KID` 会收到「登录超时，请重新登录」——看着像 cookie 过期，其实只是没带全。
 
-整段粘进去就行，无关的 cookie 会被忽略。不想让密钥出现在进程参数里：
+整段粘进去就行，无关的 cookie 会被忽略。命令行参数同机任何用户都能用 `ps` 看到，想避开就用环境变量：
 
 ```
-115dav -cookie-file ~/.115cookie
-PAN115_COOKIE='UID=...' 115dav
+PAN115_COOKIE='UID=...; CID=...; SEID=...; KID=...' 115dav
 ```
 
 启动时会验证一次，cookie 不通就直接退出。
@@ -37,10 +36,10 @@ PAN115_COOKIE='UID=...' 115dav
 
 ```
 115dav -cookie-server https://sync.example.com \
-       -cookie-channel 我的频道 -cookie-key-file /etc/115dav.key
+       -cookie-channel 我的频道 -cookie-key 频道key
 ```
 
-给只读 key 就够。和 `-cookie` / `-cookie-file` / `PAN115_COOKIE` 二选一，同时给会报错。
+给只读 key 就够。key 同样可以用 `PAN115_COOKIE_KEY` 传，避开 `ps`。和 `-cookie` / `PAN115_COOKIE` 二选一，同时给会报错。
 
 - 115 拒绝当前 cookie 时自动回服务器重取；服务器上还是那份就不再试。
 - 取不到可用 cookie 期间一律回 **503 + `Retry-After`**（默认 30 秒内不再打扰 115 和 cookie 服务器）。
@@ -51,7 +50,7 @@ PAN115_COOKIE='UID=...' 115dav
 | --- | --- | --- |
 | `-cookie-server` | — | 服务器地址，或 `PAN115_COOKIE_SERVER` |
 | `-cookie-channel` | — | 频道名，或 `PAN115_COOKIE_CHANNEL` |
-| `-cookie-key` / `-cookie-key-file` | — | 频道 key，或 `PAN115_COOKIE_KEY` |
+| `-cookie-key` | — | 频道 key，或 `PAN115_COOKIE_KEY` |
 | `-cookie-domain` | `115.com` | 读频道里的哪个 domain |
 | `-cookie-retry` | `30s` | 取不到可用 cookie 后的静默期 |
 
@@ -60,7 +59,7 @@ PAN115_COOKIE='UID=...' 115dav
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
 | `-listen` | `:8115` | 监听地址 |
-| `-cookie` / `-cookie-file` | — | 115 cookie，或 `PAN115_COOKIE` |
+| `-cookie` | — | 115 cookie，或 `PAN115_COOKIE` |
 | `-user` / `-pass` | 空 | HTTP Basic 认证，或 `PAN115_USER` / `PAN115_PASS` |
 | `-root` | `0` | 只挂某个子目录时填它的 115 目录 id |
 | `-dir-ttl` | `30s` | 目录列表缓存时长 |
