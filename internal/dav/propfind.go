@@ -44,19 +44,36 @@ type snapshot struct {
 }
 
 // snapshot resolves the whole response up front.
+//
+// Lookup already retries a walk that an expired listing sent wrong. What it
+// cannot see is the last step: this directory's own id turning out to be one
+// 115 no longer knows, which happens when the directory was deleted and the
+// listing that named it has not caught up. Refreshing that listing is the
+// only thing that can say so.
 func (e *epoch) snapshot(ctx context.Context, name string, depth int) (snapshot, error) {
-	entry, err := e.tree.Lookup(ctx, name)
+	snap, from, err := e.resolveSnapshot(ctx, name, depth)
+	if !from.Stale || !staleAnswer(err) {
+		return snap, err
+	}
+	e.tree.Forget(from.Dir)
+	snap, _, err = e.resolveSnapshot(ctx, name, depth)
+	return snap, err
+}
+
+func (e *epoch) resolveSnapshot(ctx context.Context, name string, depth int) (snapshot, Origin, error) {
+	entry, from, err := e.tree.Lookup(ctx, name, forWalk)
 	if err != nil {
-		return snapshot{}, err
+		return snapshot{}, from, err
 	}
 
 	snap := snapshot{base: path.Clean("/" + strings.Trim(name, "/")), self: entry}
 	if depth == 1 && entry.IsDir {
-		if snap.children, err = e.tree.Children(ctx, entry.ID); err != nil {
-			return snapshot{}, err
+		// The listing being reported: this is the one that must be current.
+		if snap.children, err = e.tree.Children(ctx, entry.ID, forDisplay); err != nil {
+			return snapshot{}, from, err
 		}
 	}
-	return snap, nil
+	return snap, from, nil
 }
 
 // href is the URL a response element points at. Directories carry a trailing

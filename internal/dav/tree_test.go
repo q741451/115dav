@@ -112,7 +112,7 @@ func TestLookupWalksAndCaches(t *testing.T) {
 	}}
 	tree := NewTree(context.Background(), backend, "0", time.Minute)
 
-	entry, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv")
+	entry, _, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv", forDisplay)
 	if err != nil {
 		t.Fatalf("Lookup: %v", err)
 	}
@@ -123,7 +123,7 @@ func TestLookupWalksAndCaches(t *testing.T) {
 		t.Fatalf("list calls = %d, want 3", got)
 	}
 
-	if _, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv"); err != nil {
+	if _, _, err := tree.Lookup(context.Background(), "/Shows/S1/ep1.mkv", forDisplay); err != nil {
 		t.Fatal(err)
 	}
 	if got := backend.calls.Load(); got != 3 {
@@ -141,7 +141,7 @@ func TestLookupMissing(t *testing.T) {
 		"/nope.mkv",
 		"/film.mkv/deeper.mkv", // descending through a file
 	} {
-		if _, err := tree.Lookup(context.Background(), path); !errors.Is(err, fs.ErrNotExist) {
+		if _, _, err := tree.Lookup(context.Background(), path, forDisplay); !errors.Is(err, fs.ErrNotExist) {
 			t.Errorf("Lookup(%q) err = %v, want fs.ErrNotExist", path, err)
 		}
 	}
@@ -154,7 +154,7 @@ func TestExpiredListingIsRefetched(t *testing.T) {
 	tree := NewTree(context.Background(), backend, "0", time.Nanosecond)
 
 	for range 3 {
-		if _, err := tree.Children(context.Background(), "0"); err != nil {
+		if _, err := tree.Children(context.Background(), "0", forDisplay); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Millisecond)
@@ -178,7 +178,7 @@ func TestConcurrentMissesCollapse(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := tree.Children(context.Background(), "0"); err != nil {
+			if _, err := tree.Children(context.Background(), "0", forDisplay); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -205,24 +205,24 @@ func TestOverflowKeepsTheListingJustFetched(t *testing.T) {
 	tree := NewTree(context.Background(), backend, "0", time.Hour)
 	ctx := context.Background()
 
-	if _, err := tree.Children(ctx, "a"); err != nil {
+	if _, err := tree.Children(ctx, "a", forDisplay); err != nil {
 		t.Fatal(err)
 	}
 	// Two of these do not fit, so storing the second empties the cache first.
-	if _, err := tree.Children(ctx, "b"); err != nil {
+	if _, err := tree.Children(ctx, "b", forDisplay); err != nil {
 		t.Fatal(err)
 	}
 	calls := backend.calls.Load()
 
 	// The one just fetched is still there.
-	if _, err := tree.Children(ctx, "b"); err != nil {
+	if _, err := tree.Children(ctx, "b", forDisplay); err != nil {
 		t.Fatal(err)
 	}
 	if backend.calls.Load() != calls {
 		t.Error("the listing that triggered the overflow was evicted by it")
 	}
 	// The older one is gone, which is the point.
-	if _, err := tree.Children(ctx, "a"); err != nil {
+	if _, err := tree.Children(ctx, "a", forDisplay); err != nil {
 		t.Fatal(err)
 	}
 	if backend.calls.Load() != calls+1 {
@@ -241,7 +241,7 @@ func TestADirectoryBiggerThanTheBudgetStillWorks(t *testing.T) {
 	backend := &stubBackend{dirs: map[string][]pan115.Entry{"h": huge}}
 	tree := NewTree(context.Background(), backend, "0", time.Hour)
 
-	got, err := tree.Children(context.Background(), "h")
+	got, err := tree.Children(context.Background(), "h", forDisplay)
 	if err != nil {
 		t.Fatal(err)
 	}

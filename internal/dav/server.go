@@ -223,23 +223,43 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	got, err := withEpoch(s.epochs, r.Context(), func(e *epoch) (content, error) {
-		if release != nil {
-			release()
-			release = nil
-		}
-		entry, err := e.tree.Lookup(r.Context(), r.URL.Path)
-		if err != nil || entry.IsDir || r.Method == http.MethodHead {
-			return content{epoch: e, entry: entry}, err
-		}
+		// Twice at most: a pick code read from an expired listing may belong
+		// to a file that has since been replaced, and refreshing the one
+		// listing that produced it is the only way to find that out. The
+		// second pass reads a listing it has just fetched, so it cannot ask
+		// again.
+		var (
+			last    content
+			lastErr error
+		)
+		for attempt := range 2 {
+			if release != nil {
+				release()
+				release = nil
+			}
+			entry, from, err := e.tree.Lookup(r.Context(), r.URL.Path, forWalk)
+			if err != nil || entry.IsDir || r.Method == http.MethodHead {
+				return content{epoch: e, entry: entry}, err
+			}
 
-		id := identityOf(entry)
-		ctx, mine, give := s.stream.slots.acquire(r.Context(), entry.PickCode, entry.Name)
-		release = give
-		resp, err := s.stream.open(ctx, r, e, entry, id)
-		if err != nil {
-			return content{epoch: e, entry: entry}, err
+			id := identityOf(entry)
+			ctx, mine, give := s.stream.slots.acquire(r.Context(), entry.PickCode, entry.Name)
+			release = give
+			resp, err := s.stream.open(ctx, r, e, entry, id)
+			if err == nil {
+				return content{epoch: e, entry: entry, id: id, resp: resp, slot: mine}, nil
+			}
+
+			last, lastErr = content{epoch: e, entry: entry}, err
+			if attempt == 0 && from.Stale && unusableEntry(err) {
+				s.log.Debug("the listing this file came from is out of date, refreshing it",
+					"path", r.URL.Path, "err", err)
+				e.tree.Forget(from.Dir)
+				continue
+			}
+			break
 		}
-		return content{epoch: e, entry: entry, id: id, resp: resp, slot: mine}, nil
+		return last, lastErr
 	})
 	if err != nil {
 		s.replyError(w, r, got.entry, err)
@@ -334,7 +354,7 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request, e *epoch, en
 		return
 	}
 
-	children, err := e.tree.Children(r.Context(), entry.ID)
+	children, err := e.tree.Children(r.Context(), entry.ID, forDisplay)
 	if err != nil {
 		s.replyError(w, r, pan115.Entry{}, err)
 		return

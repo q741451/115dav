@@ -101,43 +101,132 @@ func (t *Tree) Root() pan115.Entry {
 	return pan115.Entry{ID: t.rootID, Name: "/", IsDir: true}
 }
 
+// A cached listing is read for two quite different reasons, and only one of
+// them needs it to be current.
+//
+// Showing it to somebody does: a PROPFIND is how a player learns what is in a
+// folder, and a file uploaded a minute ago should appear. Walking through it
+// does not: there, the listing is only being asked which id the next path
+// segment has, and that answer changes just when a directory is renamed or
+// moved.
+//
+// Every path is walked from the root on every request, because 115 addresses
+// by id and there is no usable stat-by-path. Making the walk insist on
+// freshness therefore charged each seek up to one listing per directory in the
+// path -- at two requests a second, seconds of silence before the first byte,
+// every time the TTL lapsed. Letting it read what is already there costs
+// nothing and is almost always right; forWalk marks those reads.
+const (
+	forDisplay = false
+	forWalk    = true
+)
+
+// Origin is the listing a walk got its answer from, and whether that listing
+// had expired.
+//
+// A walk that reads expired listings is nearly always right: an id and a pick
+// code survive a rename and a move, and change only when the thing they name
+// is deleted and something takes its place. When it is wrong, it is wrong
+// because one particular listing is out of date -- so the cure is to refresh
+// that one and try again, not to re-list the whole path.
+type Origin struct {
+	// Dir is the directory whose listing produced the entry, or, when a
+	// segment was missing, the directory that should have contained it. When
+	// listing a directory failed outright it is the directory that handed out
+	// the id, since that is what turned out to be wrong.
+	Dir   string
+	Stale bool
+}
+
 // Lookup resolves a slash-separated path to an entry, walking from the root.
-func (t *Tree) Lookup(ctx context.Context, name string) (pan115.Entry, error) {
+//
+// stale is forWalk to prefer what is cached. It also reports where the answer
+// came from, so that a caller who discovers the answer is wrong -- a pick code
+// 115 will not serve, say -- can invalidate the one listing responsible.
+func (t *Tree) Lookup(ctx context.Context, name string, stale bool) (pan115.Entry, Origin, error) {
+	entry, from, err := t.walk(ctx, name, stale)
+	if !from.Stale || !staleAnswer(err) {
+		return entry, from, err
+	}
+	// The listing that gave this answer had expired, and the answer did not
+	// work. Refresh that one and walk again; everything else still comes from
+	// cache, so this costs exactly one listing. Once is enough -- the second
+	// walk reads a listing it has just fetched, so it cannot ask again.
+	t.Forget(from.Dir)
+	return t.walk(ctx, name, stale)
+}
+
+// staleAnswer reports whether an error is the kind an out-of-date listing
+// produces: a name that is no longer there, or an id 115 no longer knows.
+func staleAnswer(err error) bool {
+	return errors.Is(err, fs.ErrNotExist) || errors.Is(err, pan115.ErrNotFound)
+}
+
+// unusableEntry widens staleAnswer to the way a file reports it: a pick code
+// 115 acknowledges but will not serve. That is what a file replaced under the
+// same name looks like from here.
+func unusableEntry(err error) bool {
+	var notDownloadable *pan115.ErrNotDownloadable
+	return staleAnswer(err) || errors.As(err, &notDownloadable)
+}
+
+func (t *Tree) walk(ctx context.Context, name string, stale bool) (pan115.Entry, Origin, error) {
 	current := t.Root()
+	var from Origin
 	for _, segment := range splitPath(name) {
 		if !current.IsDir {
-			return pan115.Entry{}, fs.ErrNotExist
+			return pan115.Entry{}, from, fs.ErrNotExist
 		}
-		dir, err := t.children(ctx, current.ID)
+		dir, err := t.children(ctx, current.ID, stale)
 		if err != nil {
-			return pan115.Entry{}, err
+			// This directory could not be listed at all -- most often because
+			// 115 no longer has the id. The id came from the previous
+			// listing, which from still names, and that is the one at fault.
+			return pan115.Entry{}, from, err
 		}
+		from = Origin{Dir: current.ID, Stale: !time.Now().Before(dir.expires)}
 		i, ok := dir.byName[segment]
 		if !ok {
-			return pan115.Entry{}, fs.ErrNotExist
+			return pan115.Entry{}, from, fs.ErrNotExist
 		}
 		current = dir.entries[i]
 	}
-	return current, nil
+	return current, from, nil
 }
 
-// Children lists a directory, serving from cache when it is still fresh.
-func (t *Tree) Children(ctx context.Context, id string) ([]pan115.Entry, error) {
-	dir, err := t.children(ctx, id)
+// Forget drops one directory's listing, so that the next read fetches it.
+func (t *Tree) Forget(id string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if dir, ok := t.dirs[id]; ok {
+		t.entries -= weigh(dir)
+		delete(t.dirs, id)
+	}
+}
+
+// Children lists a directory. stale is forWalk when the listing is only being
+// used to translate a path, forDisplay when somebody is about to read it.
+func (t *Tree) Children(ctx context.Context, id string, stale bool) ([]pan115.Entry, error) {
+	dir, err := t.children(ctx, id, stale)
 	if err != nil {
 		return nil, err
 	}
 	return dir.entries, nil
 }
 
-func (t *Tree) children(ctx context.Context, id string) (*directory, error) {
-	if dir := t.cached(id); dir != nil {
+func (t *Tree) children(ctx context.Context, id string, stale bool) (*directory, error) {
+	if dir := t.cached(id, stale); dir != nil {
 		return dir, nil
 	}
 
 	// Collapse concurrent misses so a burst of PROPFINDs costs one API call.
 	loaded, err, _ := t.group.Do(id, func() (any, error) {
-		if dir := t.cached(id); dir != nil {
+		// Deliberately not stale here, whoever asked. A caller willing to read
+		// an expired listing has already been given it above, so reaching this
+		// point means there is nothing cached at all -- and answering a caller
+		// that does want a current one with somebody else's expired entry
+		// would be exactly the sharing bug this collapse exists to avoid.
+		if dir := t.cached(id, forDisplay); dir != nil {
 			return dir, nil
 		}
 		// The listing is shared with everyone else waiting on this id, so it
@@ -162,10 +251,14 @@ func (t *Tree) children(ctx context.Context, id string) (*directory, error) {
 	return loaded.(*directory), nil
 }
 
-func (t *Tree) cached(id string) *directory {
+func (t *Tree) cached(id string, stale bool) *directory {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if dir, ok := t.dirs[id]; ok && time.Now().Before(dir.expires) {
+	dir, ok := t.dirs[id]
+	if !ok {
+		return nil
+	}
+	if stale || time.Now().Before(dir.expires) {
 		return dir
 	}
 	return nil
