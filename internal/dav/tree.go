@@ -56,13 +56,15 @@ type Tree struct {
 	entries int // total across dirs, kept in step with the map below
 }
 
-// Bounds on the cache. Directory count alone says nothing about memory: a
-// library scan walks thousands of directories in minutes, and it is the
-// entries inside them that occupy the space. At roughly 200 bytes an entry
-// the ceiling below is on the order of ten megabytes, which is affordable on
-// the routers this is built for.
 const (
-	maxCachedDirs    = 4096
+	// maxCachedEntries bounds the cache. It is entries rather than
+	// directories because that is what occupies the space: a library scan
+	// walks thousands of directories in minutes, and an empty one costs
+	// nothing to hold. At roughly 200 bytes an entry this is some twelve
+	// megabytes, affordable on the routers this is built for.
+	//
+	// A directory still counts as one, so that an account of nothing but
+	// empty folders cannot fill the map without ever tripping the bound.
 	maxCachedEntries = 60000
 
 	// listTimeout bounds a listing that no longer has a caller waiting for
@@ -169,60 +171,36 @@ func (t *Tree) cached(id string) *directory {
 	return nil
 }
 
+// store adds a listing, emptying the cache first if it will not fit.
+//
+// Emptying it wholesale, rather than evicting a victim, is the deliberate
+// part. A media library is walked in bursts, so a cold cache costs one rescan
+// -- while any policy that chooses what to keep needs per-entry bookkeeping to
+// avoid thrashing, and would be several times this much code to serve a case
+// that arrives once in sixty directories.
+//
+// Clearing before the insert rather than after is what makes the listing just
+// fetched survive: it is the one being read right now. A directory bigger than
+// the whole budget is stored anyway and evicts itself on the next miss.
 func (t *Tree) store(id string, dir *directory) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+
 	if previous, ok := t.dirs[id]; ok {
-		t.entries -= len(previous.entries)
-	}
-	t.dirs[id] = dir
-	t.entries += len(dir.entries)
-	if t.overLimitLocked() {
-		t.sweepLocked(id)
-	}
-}
-
-func (t *Tree) overLimitLocked() bool {
-	return len(t.dirs) > maxCachedDirs || t.entries > maxCachedEntries
-}
-
-// sweepLocked drops expired listings, and failing that everything except the
-// directory just stored -- which is the one being read right now. A media
-// library is walked in bursts, so a cold cache costs one rescan rather than
-// the steady thrash a strict LRU would need bookkeeping to avoid.
-func (t *Tree) sweepLocked(keep string) {
-	now := time.Now()
-	for id, dir := range t.dirs {
-		if now.After(dir.expires) {
-			delete(t.dirs, id)
-			t.entries -= len(dir.entries)
-		}
-	}
-	if !t.overLimitLocked() {
-		return
-	}
-
-	kept := t.dirs[keep]
-	clear(t.dirs)
-	t.entries = 0
-	if kept != nil {
-		// A single directory larger than the whole budget is still worth
-		// keeping: it is already in memory, and dropping it would mean
-		// listing it again on the very next request.
-		t.dirs[keep] = kept
-		t.entries = len(kept.entries)
-	}
-}
-
-// Forget drops any cached listing for a directory.
-func (t *Tree) Forget(id string) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if dir, ok := t.dirs[id]; ok {
-		t.entries -= len(dir.entries)
+		t.entries -= weigh(previous)
 		delete(t.dirs, id)
 	}
+	if t.entries+weigh(dir) > maxCachedEntries {
+		clear(t.dirs)
+		t.entries = 0
+	}
+	t.dirs[id] = dir
+	t.entries += weigh(dir)
 }
+
+// weigh is what a cached listing costs against the budget. The extra one is
+// the directory itself; see maxCachedEntries.
+func weigh(dir *directory) int { return 1 + len(dir.entries) }
 
 // newDirectory indexes a listing by name, making the names unique and safe to
 // use as path segments so that the tree behaves like a real filesystem.

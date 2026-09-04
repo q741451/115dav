@@ -190,19 +190,63 @@ func TestConcurrentMissesCollapse(t *testing.T) {
 	}
 }
 
-func TestForgetDropsCache(t *testing.T) {
-	backend := &stubBackend{dirs: map[string][]pan115.Entry{"0": {{ID: "f1", Name: "a.mkv"}}}}
+// Going over budget empties the cache, but must not throw away the listing
+// that was just fetched -- that is the one being read right now, and losing it
+// would mean listing it again on the very next request.
+func TestOverflowKeepsTheListingJustFetched(t *testing.T) {
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{}}
+	big := make([]pan115.Entry, maxCachedEntries*2/3)
+	for i := range big {
+		big[i] = pan115.Entry{ID: fmt.Sprint("f", i), Name: fmt.Sprint("film", i, ".mkv")}
+	}
+	backend.dirs["a"] = big
+	backend.dirs["b"] = big
+
+	tree := NewTree(context.Background(), backend, "0", time.Hour)
+	ctx := context.Background()
+
+	if _, err := tree.Children(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	// Two of these do not fit, so storing the second empties the cache first.
+	if _, err := tree.Children(ctx, "b"); err != nil {
+		t.Fatal(err)
+	}
+	calls := backend.calls.Load()
+
+	// The one just fetched is still there.
+	if _, err := tree.Children(ctx, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if backend.calls.Load() != calls {
+		t.Error("the listing that triggered the overflow was evicted by it")
+	}
+	// The older one is gone, which is the point.
+	if _, err := tree.Children(ctx, "a"); err != nil {
+		t.Fatal(err)
+	}
+	if backend.calls.Load() != calls+1 {
+		t.Error("the cache did not shed anything when it went over budget")
+	}
+}
+
+// A single directory larger than the entire budget is still served. It cannot
+// be cached usefully, but refusing it would make the folder unreadable rather
+// than merely slow.
+func TestADirectoryBiggerThanTheBudgetStillWorks(t *testing.T) {
+	huge := make([]pan115.Entry, maxCachedEntries+1000)
+	for i := range huge {
+		huge[i] = pan115.Entry{ID: fmt.Sprint("f", i), Name: fmt.Sprint("film", i, ".mkv")}
+	}
+	backend := &stubBackend{dirs: map[string][]pan115.Entry{"h": huge}}
 	tree := NewTree(context.Background(), backend, "0", time.Hour)
 
-	if _, err := tree.Children(context.Background(), "0"); err != nil {
+	got, err := tree.Children(context.Background(), "h")
+	if err != nil {
 		t.Fatal(err)
 	}
-	tree.Forget("0")
-	if _, err := tree.Children(context.Background(), "0"); err != nil {
-		t.Fatal(err)
-	}
-	if got := backend.calls.Load(); got != 2 {
-		t.Errorf("list calls = %d, want 2", got)
+	if len(got) != len(huge) {
+		t.Errorf("served %d of %d entries", len(got), len(huge))
 	}
 }
 
