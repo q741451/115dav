@@ -2,7 +2,6 @@ package dav
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -135,11 +134,12 @@ func (fi fileInfo) ContentType(context.Context) (string, error) {
 
 // ETag prefers the content hash 115 already stores, which stays stable across
 // restarts and re-listings, unlike one derived from mtime and size.
+//
+// It is entryTag rather than a copy of it: this is the value PROPFIND
+// publishes and GET must answer If-Range against, and two implementations of
+// it would eventually disagree.
 func (fi fileInfo) ETag(context.Context) (string, error) {
-	if fi.entry.SHA1 != "" {
-		return fmt.Sprintf("%q", "sha1:"+fi.entry.SHA1), nil
-	}
-	return fmt.Sprintf(`"%x%x"`, fi.ModTime().UnixNano(), fi.Size()), nil
+	return entryTag(fi.entry), nil
 }
 
 func (fi fileInfo) Name() string { return fi.entry.Name }

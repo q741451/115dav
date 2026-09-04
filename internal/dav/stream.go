@@ -173,30 +173,54 @@ func newStreamer(backend Backend, linkTTL, retryAfter time.Duration, log *slog.L
 	}
 }
 
+// identity is what a file is, as opposed to what one transfer of it looks
+// like. PROPFIND, HEAD and GET must agree on every field here, so all three
+// derive it from the same place -- the directory listing -- through this type.
+//
+// None of it is taken from the CDN, which reports its own ETag (a chunked MD5
+// meaningful only to that CDN) and its own modification time (when the object
+// reached that node, measured 52 seconds off the real one). A client that saw
+// the listing's answer and then the CDN's has no way to tell it is looking at
+// the same file.
+type identity struct {
+	size        int64
+	etag        string
+	modTime     time.Time
+	contentType string
+}
+
+func identityOf(entry pan115.Entry) identity {
+	return identity{
+		size:        entry.Size,
+		etag:        entryTag(entry),
+		modTime:     entry.ModTime,
+		contentType: contentType(entry.Name),
+	}
+}
+
+// apply writes the fields that describe the file itself. Content-Length is not
+// among them: it describes the response, and a 206 carries the length of the
+// part rather than of the file.
+func (id identity) apply(header http.Header) {
+	header.Set("Content-Type", id.contentType)
+	header.Set("ETag", id.etag)
+	if !id.modTime.IsZero() {
+		header.Set("Last-Modified", id.modTime.UTC().Format(http.TimeFormat))
+	}
+}
+
 // serveHead answers from directory metadata alone. Players probe with HEAD
 // before opening a stream, and there is no reason to spend a resolve on it.
 func (s *streamer) serveHead(w http.ResponseWriter, entry pan115.Entry) {
 	header := w.Header()
 	header.Set("Accept-Ranges", "bytes")
 	header.Set("Content-Length", strconv.FormatInt(entry.Size, 10))
-	setIdentity(header, entry)
+	identityOf(entry).apply(header)
 	w.WriteHeader(http.StatusOK)
 }
 
-// setIdentity applies the metadata that must be the same however the file was
-// asked about. The CDN answers with its own ETag and its own idea of the
-// modification time, both different from what PROPFIND reported for the same
-// file; a client that saw one and then the other has no way to tell it is
-// looking at the same thing.
-func setIdentity(header http.Header, entry pan115.Entry) {
-	header.Set("Content-Type", contentType(entry.Name))
-	header.Set("ETag", entryTag(entry))
-	if !entry.ModTime.IsZero() {
-		header.Set("Last-Modified", entry.ModTime.UTC().Format(http.TimeFormat))
-	}
-}
-
-// entryTag is the same value fileInfo.ETag reports through PROPFIND.
+// entryTag is the same value fileInfo.ETag reports through PROPFIND; both go
+// through here so the two cannot drift.
 func entryTag(entry pan115.Entry) string {
 	if entry.SHA1 != "" {
 		return strconv.Quote("sha1:" + entry.SHA1)
@@ -205,19 +229,30 @@ func entryTag(entry pan115.Entry) string {
 	if modTime.IsZero() {
 		modTime = time.Unix(0, 0)
 	}
-	return fmt.Sprintf(`"%x%x"`, modTime.UnixNano(), entry.Size)
+	// The separator is load-bearing: without it (1, 0x23) and (0x12, 3) are
+	// both "123", so two files could share a tag.
+	return fmt.Sprintf(`"%x-%x"`, modTime.UnixNano(), entry.Size)
 }
 
 // serveGet streams the file, forwarding the client's range request upstream.
 func (s *streamer) serveGet(w http.ResponseWriter, r *http.Request, entry pan115.Entry) {
-	resp, err := s.open(r, entry)
+	id := identityOf(entry)
+	resp, err := s.open(r, entry, id)
 	if err != nil {
 		s.fail(w, r, entry, err)
 		return
 	}
 	defer resp.Body.Close()
 
-	copyResponseHeaders(w.Header(), resp.Header, entry)
+	// The last point at which a disagreement can still be reported: nothing has
+	// been written yet, so this can be a status code rather than a truncated
+	// file the client would take for the real one.
+	if err := id.checkLength(resp, entry.Name); err != nil {
+		s.fail(w, r, entry, err)
+		return
+	}
+
+	copyResponseHeaders(w.Header(), resp.Header, id)
 	w.WriteHeader(resp.StatusCode)
 
 	buf := s.bufs.Get().(*[]byte)
@@ -259,12 +294,21 @@ func (c *clientWriter) Write(p []byte) (int, error) {
 
 // open resolves the file and performs the upstream request, retrying once if
 // the CDN rejects the cached URL or the connection fails outright.
-func (s *streamer) open(r *http.Request, entry pan115.Entry) (*http.Response, error) {
+func (s *streamer) open(r *http.Request, entry pan115.Entry, id identity) (*http.Response, error) {
 	var lastErr error
 	for attempt := range 2 {
 		target, err := s.links.get(r.Context(), entry.PickCode)
 		if err != nil {
 			return nil, err
+		}
+		// The resolve reports the file's size too, and it was paid for
+		// already. Checking it here catches a stale listing one round trip
+		// before the CDN would, and without opening a connection.
+		if target.Size > 0 && target.Size != id.size {
+			return nil, &errStaleEntry{
+				file: entry.Name, wanted: id.size, actual: target.Size,
+				source: "the 115 download endpoint",
+			}
 		}
 
 		resp, err := s.fetch(r, entry, target)
@@ -386,22 +430,67 @@ var passthroughHeaders = []string{
 	"Content-Range",
 }
 
-func copyResponseHeaders(dst, src http.Header, entry pan115.Entry) {
+func copyResponseHeaders(dst, src http.Header, id identity) {
 	for _, name := range passthroughHeaders {
 		if value := src.Get(name); value != "" {
 			dst.Set(name, value)
 		}
 	}
 	dst.Set("Accept-Ranges", "bytes")
-	setIdentity(dst, entry)
+	id.apply(dst)
 
 	// The CDN labels nearly everything as a generic binary stream, so our own
 	// guess is used above; fall back to its label only when we have none.
-	if contentType(entry.Name) == defaultContentType {
+	if id.contentType == defaultContentType {
 		if value := src.Get("Content-Type"); value != "" {
 			dst.Set("Content-Type", value)
 		}
 	}
+}
+
+// errStaleEntry reports that the file the CDN is about to send is not the one
+// the listing described.
+type errStaleEntry struct {
+	file           string
+	wanted, actual int64
+	source         string
+}
+
+func (e *errStaleEntry) Error() string {
+	return fmt.Sprintf("%s says %s is %d bytes, but the listing this request was answered from says %d;"+
+		" the cached directory is stale", e.source, e.file, e.actual, e.wanted)
+}
+
+// checkLength refuses a transfer whose size contradicts the identity already
+// promised for this file.
+//
+// Length is the one field that both sides state, so it is the one place the
+// two sources of truth can be caught disagreeing. They disagree when a file
+// has been replaced under the same name since the directory was listed, and
+// serving it anyway would send the new file's bytes under the old file's ETag,
+// modification time and -- for a HEAD already answered -- length. Refusing
+// costs this one request; the listing expires and the next one is right.
+func (id identity) checkLength(resp *http.Response, file string) error {
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		// "bytes 100-199/21981": only the total is ours to check. A "*" total
+		// is legal and says the CDN does not know it, which is not a conflict.
+		_, total, ok := strings.Cut(resp.Header.Get("Content-Range"), "/")
+		if !ok || total == "*" {
+			return nil
+		}
+		size, err := strconv.ParseInt(strings.TrimSpace(total), 10, 64)
+		if err != nil || size == id.size {
+			return nil
+		}
+		return &errStaleEntry{file: file, wanted: id.size, actual: size, source: "the CDN's Content-Range"}
+	case http.StatusOK:
+		if resp.ContentLength < 0 || resp.ContentLength == id.size {
+			return nil
+		}
+		return &errStaleEntry{file: file, wanted: id.size, actual: resp.ContentLength, source: "the CDN's Content-Length"}
+	}
+	return nil
 }
 
 const defaultContentType = "application/octet-stream"
