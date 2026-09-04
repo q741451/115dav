@@ -19,7 +19,7 @@ func newTestClient(t *testing.T, handler http.HandlerFunc) (*Client, *httptest.S
 	t.Cleanup(server.Close)
 
 	client, err := New(Config{
-		Cookie:            "UID=u; CID=c; SEID=s",
+		Cookie:            "UID=u; CID=c; SEID=s; KID=k",
 		RequestsPerSecond: 1000, // the limiter is not under test
 	})
 	if err != nil {

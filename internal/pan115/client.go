@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -40,9 +41,9 @@ const (
 
 // Config describes how to talk to 115.
 type Config struct {
-	// Cookie is the browser cookie for the account, e.g.
-	// "UID=...; CID=...; SEID=...; KID=...". Surrounding whitespace, a
-	// leading "Cookie:" and unrelated cookie pairs are all tolerated.
+	// Cookie is the browser cookie for the account. All four of UID, CID,
+	// SEID and KID must be present; anything else pasted alongside them is
+	// passed through untouched.
 	Cookie string
 
 	// UserAgent defaults to DefaultUserAgent.
@@ -113,18 +114,28 @@ func cmpOr[T comparable](v, fallback T) T {
 	return v
 }
 
-// requiredCookies must all be present for the API to accept us. KID appears
-// on newer sessions and is forwarded when present, but is not required.
-var requiredCookies = []string{"UID", "CID", "SEID"}
+// requiredCookies must all be present for the API to accept us. KID is not
+// optional despite looking like a newer addition: without it the file list
+// endpoint answers 990001, "login timed out", as if the session were stale.
+var requiredCookies = []string{"UID", "CID", "SEID", "KID"}
 
-// normaliseCookie extracts the 115 session cookies from whatever the user
-// pasted and rebuilds a canonical Cookie header value.
+// normaliseCookie checks that a pasted cookie carries a usable 115 session and
+// tidies it into a header value.
+//
+// Everything pasted is forwarded, not just the names above: that is what the
+// browser does, and a cookie 115 starts requiring later then works without a
+// change here. Only the required names are normalised, so a cookie copied with
+// lowercase names still matches.
 func normaliseCookie(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
-	raw = strings.TrimPrefix(raw, "Cookie:")
-	raw = strings.TrimPrefix(raw, "cookie:")
+	for _, prefix := range []string{"Cookie:", "cookie:"} {
+		raw = strings.TrimPrefix(raw, prefix)
+	}
 
-	found := map[string]string{}
+	var (
+		pairs   []string
+		present = map[string]bool{}
+	)
 	for _, pair := range strings.FieldsFunc(raw, func(r rune) bool {
 		return r == ';' || r == '\n' || r == '\r'
 	}) {
@@ -132,34 +143,26 @@ func normaliseCookie(raw string) (string, error) {
 		if !ok {
 			continue
 		}
-		name = strings.ToUpper(strings.TrimSpace(name))
-		value = strings.TrimSpace(value)
-		if value == "" {
+		name, value = strings.TrimSpace(name), strings.TrimSpace(value)
+		if name == "" || value == "" {
 			continue
 		}
-		switch name {
-		case "UID", "CID", "SEID", "KID":
-			found[name] = value
+		if upper := strings.ToUpper(name); slices.Contains(requiredCookies, upper) {
+			name = upper
+			present[upper] = true
 		}
+		pairs = append(pairs, name+"="+value)
 	}
 
 	var missing []string
 	for _, name := range requiredCookies {
-		if found[name] == "" {
+		if !present[name] {
 			missing = append(missing, name)
 		}
 	}
 	if len(missing) > 0 {
-		return "", fmt.Errorf("cookie is missing %s; copy the whole 115.com cookie from your browser",
+		return "", fmt.Errorf("cookie is missing %s; copy every 115.com cookie from your browser, not just some of them",
 			strings.Join(missing, ", "))
-	}
-
-	// Canonical order, KID last so older sessions round-trip unchanged.
-	pairs := make([]string, 0, 4)
-	for _, name := range []string{"UID", "CID", "SEID", "KID"} {
-		if v := found[name]; v != "" {
-			pairs = append(pairs, name+"="+v)
-		}
 	}
 	return strings.Join(pairs, "; "), nil
 }

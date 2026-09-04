@@ -15,20 +15,23 @@ func TestNormaliseCookie(t *testing.T) {
 			raw:  "UID=a; CID=b; SEID=c; KID=d",
 			want: "UID=a; CID=b; SEID=c; KID=d",
 		},
-		"reordered and unspaced": {
-			raw:  "SEID=c;UID=a;CID=b",
-			want: "UID=a; CID=b; SEID=c",
+		"unspaced, order preserved": {
+			raw:  "SEID=c;UID=a;KID=d;CID=b",
+			want: "SEID=c; UID=a; KID=d; CID=b",
 		},
-		"pasted with header name and noise": {
-			raw:  "Cookie: _did=x; UID=a; CID=b; SEID=c; acw_tc=y\n",
-			want: "UID=a; CID=b; SEID=c",
+		"lowercase names are normalised": {
+			raw:  "uid=a; cid=b; seid=c; kid=d",
+			want: "UID=a; CID=b; SEID=c; KID=d",
 		},
-		"lowercase names": {
-			raw:  "uid=a; cid=b; seid=c",
-			want: "UID=a; CID=b; SEID=c",
+		"pasted with a header name and other cookies": {
+			// Everything is forwarded: the browser sends it all, and a
+			// cookie 115 starts requiring later then needs no code change.
+			raw:  "Cookie: _did=x; UID=a; CID=b; SEID=c; KID=d; acw_tc=y\n",
+			want: "_did=x; UID=a; CID=b; SEID=c; KID=d; acw_tc=y",
 		},
-		"missing SEID":   {raw: "UID=a; CID=b", wantErr: true},
-		"empty value":    {raw: "UID=; CID=b; SEID=c", wantErr: true},
+		"missing KID":    {raw: "UID=a; CID=b; SEID=c", wantErr: true},
+		"missing SEID":   {raw: "UID=a; CID=b; KID=d", wantErr: true},
+		"empty value":    {raw: "UID=; CID=b; SEID=c; KID=d", wantErr: true},
 		"nothing at all": {raw: "   ", wantErr: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -49,12 +52,14 @@ func TestNormaliseCookie(t *testing.T) {
 	}
 }
 
+// Leaving KID out is the mistake that looks like an expired login: 115 answers
+// 990001 rather than naming the missing cookie, so we name it first.
 func TestMissingCookieNamesAreReported(t *testing.T) {
-	_, err := normaliseCookie("UID=a")
+	_, err := normaliseCookie("UID=a; CID=b")
 	if err == nil {
 		t.Fatal("want an error")
 	}
-	for _, want := range []string{"CID", "SEID"} {
+	for _, want := range []string{"SEID", "KID"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q does not mention the missing %s", err, want)
 		}
@@ -62,7 +67,7 @@ func TestMissingCookieNamesAreReported(t *testing.T) {
 }
 
 func TestPageSizeIsClamped(t *testing.T) {
-	client, err := New(Config{Cookie: "UID=a; CID=b; SEID=c", PageSize: 99999})
+	client, err := New(Config{Cookie: "UID=a; CID=b; SEID=c; KID=d", PageSize: 99999})
 	if err != nil {
 		t.Fatal(err)
 	}
