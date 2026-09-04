@@ -359,14 +359,7 @@ func (s *streamer) open(ctx context.Context, r *http.Request, e *epoch, entry pa
 			// a home uplink drops connections for a living. The cached URL is
 			// kept: it is the connection that failed, not the link.
 			if ctx.Err() != nil {
-				if r.Context().Err() == nil {
-					// Not the client leaving: this read was cut to admit a
-					// newer one of the same file. Saying "bad gateway" would
-					// blame 115 for a decision made here, and tell the player
-					// to give up on something it should retry.
-					return nil, &upstreamError{file: entry.Name, evicted: true}
-				}
-				return nil, err
+				return nil, cancelled(ctx, r, entry, err)
 			}
 			lastErr = err
 			if attempt == 0 {
@@ -383,10 +376,12 @@ func (s *streamer) open(ctx context.Context, r *http.Request, e *epoch, entry pa
 			}
 			s.log.Debug("115 is already serving this file as often as it allows, waiting",
 				"file", entry.Name, "attempt", throttles)
+			wait := time.NewTimer(throttleBackoff)
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(throttleBackoff):
+				wait.Stop()
+				return nil, cancelled(ctx, r, entry, ctx.Err())
+			case <-wait.C:
 			}
 			continue
 		case !expired:
@@ -410,6 +405,22 @@ func (s *streamer) open(ctx context.Context, r *http.Request, e *epoch, entry pa
 		attempt++
 	}
 	return nil, lastErr
+}
+
+// cancelled says why a read stopped, for the two places that can notice.
+//
+// A cancelled stream context means one of two things, and only the request's
+// own context tells them apart: the client went away, which is routine and
+// needs no answer, or this read was cut here to admit a newer one of the same
+// file, which the client did not ask for and should retry. Reporting the
+// second as a plain cancellation makes it a bad gateway -- blaming 115 for a
+// decision made here, and inviting the player to give up on a file that is
+// perfectly fine.
+func cancelled(ctx context.Context, r *http.Request, entry pan115.Entry, err error) error {
+	if r.Context().Err() == nil {
+		return &upstreamError{file: entry.Name, evicted: true}
+	}
+	return err
 }
 
 // rangeStillApplies evaluates If-Range against what we told the client this

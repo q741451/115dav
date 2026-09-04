@@ -353,3 +353,43 @@ func TestAnEvictedReadIs503NotABadGateway(t *testing.T) {
 	}
 	t.Logf("statuses: %v", got)
 }
+
+// A read can be evicted while it is waiting out a throttle, not only while it
+// is opening. Both are the same event to the client -- it asked for a file and
+// somebody newer took the slot -- so both must answer the same way. The two
+// exits were not always in step: one reported it, the other returned a bare
+// cancellation and became a bad gateway.
+func TestAReadEvictedWhileWaitingOutAThrottleIs503(t *testing.T) {
+	b := sample(t)
+	b.throttleFirst.Store(1 << 20) // permanently busy, so every read waits
+	srv := newTestServer(t, b, Options{})
+	srv.Config.Handler.(*Server).stream.slots.limit = 1
+
+	codes := make(chan int, 2)
+	for range 2 {
+		go func() {
+			resp, err := srv.Client().Get(srv.URL + "/film.mkv")
+			if err != nil {
+				codes <- 0
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			codes <- resp.StatusCode
+		}()
+		// Long enough that the first is inside its backoff when the second
+		// arrives and takes the slot from it.
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	var got []int
+	for range 2 {
+		got = append(got, <-codes)
+	}
+	for _, code := range got {
+		if code != http.StatusServiceUnavailable {
+			t.Errorf("got %d; a read that lost its slot mid-wait is 503, never %d", code, code)
+		}
+	}
+	t.Logf("statuses: %v", got)
+}
