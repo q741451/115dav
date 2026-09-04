@@ -261,8 +261,16 @@ func entryTag(entry pan115.Entry) string {
 // pipe streams an already-opened upstream response to the client.
 //
 // Opening is done by the caller, inside the retry that can still replace the
-// credentials; by the time anything gets here the response is committed.
-func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, mine *slot, entry pan115.Entry, id identity, resp *http.Response) error {
+// credentials; by the time anything gets here the response is committed, which
+// is why this reports nothing. The status line has gone out, so there is no
+// answer left to give -- only a log line.
+//
+// The body is closed rather than drained. Draining would let HTTP/1.1 keep the
+// connection, which is worth about 340 ms on the next read of that file, but
+// what remains of an interrupted playback is the rest of the film. Reads that
+// finish are already reused; this is the one case where the two goals are
+// opposed, and the bandwidth wins.
+func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, mine *slot, entry pan115.Entry, id identity, resp *http.Response) {
 	defer resp.Body.Close()
 
 	if size, differs := id.actualSize(resp); differs {
@@ -301,7 +309,6 @@ func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, mine *slot, entr
 		// The status line is already out; all that is left is to record it.
 		s.log.Warn("upstream stopped sending", "file", entry.Name, "err", err)
 	}
-	return nil
 }
 
 // clientWriter remembers the first failure writing to the client, so that it

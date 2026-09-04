@@ -272,9 +272,7 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead:
 		s.stream.serveHead(w, got.entry)
 	default:
-		if err := s.stream.pipe(w, r, got.slot, got.entry, got.id, got.resp); err != nil {
-			s.replyError(w, r, got.entry, err)
-		}
+		s.stream.pipe(w, r, got.slot, got.entry, got.id, got.resp)
 	}
 }
 

@@ -38,6 +38,7 @@ type fakeBackend struct {
 	dropOnce      atomic.Bool
 	beforeList    func()
 	beforeResolve func()
+	onFetch       func(*http.Request)
 	listCalls     atomic.Int64
 	resolveCalls  atomic.Int64
 	fetches       atomic.Int64
@@ -56,6 +57,9 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 
 	b.origin = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b.fetches.Add(1)
+		if b.onFetch != nil {
+			b.onFetch(r)
+		}
 
 		// Drop the connection without answering, the way a flaky uplink does.
 		if b.dropOnce.CompareAndSwap(true, false) {
