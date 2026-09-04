@@ -393,3 +393,22 @@ func TestAReadEvictedWhileWaitingOutAThrottleIs503(t *testing.T) {
 	}
 	t.Logf("statuses: %v", got)
 }
+
+// Giving a slot back must also stop the read it admitted.
+//
+// A leak test cannot catch this one: the stream context is a child of the
+// request's, so the handler returning cancels it either way. What it would
+// cost is promptness -- 115 counts a read until its connection goes away, and
+// the whole point of the slot is to stop counting as soon as we are done.
+func TestReleasingStopsTheRead(t *testing.T) {
+	s := testSlots(2)
+	stream, _, release := s.acquire(context.Background(), "pc", "film.mkv")
+	if stream.Err() != nil {
+		t.Fatal("the read was cancelled before it began")
+	}
+
+	release()
+	if stream.Err() == nil {
+		t.Error("a released slot left its read running")
+	}
+}

@@ -182,6 +182,13 @@ func (e *epochs) close() {
 // A request therefore never straddles two sets of credentials: whatever it
 // looked up and whatever it then resolves come from the same account. A method
 // cannot take a type parameter, hence the free function.
+//
+// Only 115 rejecting the credentials is retried. A request that was sharing a
+// listing or a resolve when somebody else replaced them sees its context
+// cancelled and fails, even though the epoch that replaced it could serve --
+// deliberately, because a rotation happens perhaps once a day and the player
+// asks again. Switching credentials is not seamless here and does not try to
+// be; see the note on package session.
 func withEpoch[T any](e *epochs, ctx context.Context, op func(*epoch) (T, error)) (T, error) {
 	var zero T
 

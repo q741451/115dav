@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -378,4 +379,130 @@ type inertBackend struct{ _ byte }
 func (*inertBackend) List(context.Context, string) ([]pan115.Entry, error) { return nil, nil }
 func (*inertBackend) Resolve(context.Context, string) (*pan115.Target, error) {
 	return nil, pan115.ErrNotFound
+}
+
+// The paths added since the last soak each hold something that the request
+// ending does not give back: a slot holds a cancel func and a map entry, a
+// throttled read holds a timer, and a stale walk drops a listing on discovering
+// it was wrong. A soak that never reaches them says nothing about them.
+//
+// Note the raw client rather than do(): that helper defers closing each body to
+// the end of the test, which in a loop is itself an accumulation.
+func TestNothingAccumulatesAcrossTheContendedPaths(t *testing.T) {
+	b := sample(t)
+	b.blobs["pc-film"] = []byte(strings.Repeat("x", 1<<20))
+	b.dirs["0"][1] = pan115.Entry{
+		ID: "f1", Name: "film.mkv", Size: int64(len(b.blobs["pc-film"])),
+		PickCode: "pc-film", SHA1: "abc123", ModTime: time.Unix(1700000100, 0),
+	}
+	srv := newTestServer(t, b, Options{
+		DirTTL:  20 * time.Millisecond,
+		LinkTTL: 20 * time.Millisecond,
+	})
+	server := srv.Config.Handler.(*Server)
+
+	get := func(path string, headers map[string]string, readAll bool) int {
+		req, err := http.NewRequest(http.MethodGet, srv.URL+path, nil)
+		if err != nil {
+			return 0
+		}
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+		resp, err := srv.Client().Do(req)
+		if err != nil {
+			return 0
+		}
+		defer resp.Body.Close()
+		if readAll {
+			io.Copy(io.Discard, resp.Body)
+		} else {
+			io.CopyN(io.Discard, resp.Body, 256)
+		}
+		return resp.StatusCode
+	}
+
+	// A pooled idle connection is a cache, not a leak: the transport keeps up
+	// to MaxIdleConns of them for ninety seconds, each with a read and a write
+	// goroutine. This run deliberately tears connections down and redials, so
+	// without emptying the pools at both ends the measurement would be of the
+	// pool rather than of anything retained.
+	drainPools := func() {
+		server.stream.client.CloseIdleConnections()
+		srv.Client().CloseIdleConnections()
+		b.origin.CloseClientConnections()
+		srv.CloseClientConnections()
+	}
+
+	drainPools()
+	settle(t)
+	goroutines, fds, before := runtime.NumGoroutine(), openFiles(t), heapAfterGC()
+	var evicted, throttled int
+
+	for round := range 40 {
+		// Four at once on one file: two served, the rest evicted mid-stream.
+		var wg sync.WaitGroup
+		codes := make(chan int, 4)
+		for i := range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				codes <- get("/film.mkv", map[string]string{
+					"Range": fmt.Sprintf("bytes=%d-", i*1000),
+				}, false)
+			}()
+		}
+		wg.Wait()
+		close(codes)
+		for code := range codes {
+			if code == http.StatusServiceUnavailable {
+				evicted++
+			}
+		}
+
+		// A read 115 refuses at first and then allows: the backoff path.
+		if round%4 == 0 {
+			b.throttleFirst.Store(1)
+			get("/film.mkv", map[string]string{"Range": "bytes=0-99"}, true)
+			throttled++
+		}
+
+		// Past the TTL, so the walk reads expired listings, and every so often
+		// finds them wrong and drops one.
+		time.Sleep(25 * time.Millisecond)
+		get("/Movies/nested.mp4", nil, true)
+		if round%8 == 0 {
+			b.generation.Add(1) // every cached link is refused from here on
+		}
+		get("/no-such-file.mkv", nil, true)
+	}
+
+	drainPools()
+	settle(t)
+
+	// The run has to have reached the paths it claims, or the counts below
+	// measure an idle server.
+	t.Logf("run did: %d evictions, %d throttled reads", evicted, throttled)
+	if evicted < 10 || throttled < 5 {
+		t.Fatalf("the run evicted %d and was throttled %d times; it never reached those paths", evicted, throttled)
+	}
+
+	server.stream.slots.mu.Lock()
+	held := len(server.stream.slots.held)
+	server.stream.slots.mu.Unlock()
+	if held != 0 {
+		t.Errorf("%d files still hold slots after every request finished", held)
+	}
+
+	if grew := runtime.NumGoroutine() - goroutines; grew > 4 {
+		t.Errorf("goroutines grew by %d (from %d)", grew, goroutines)
+		buf := make([]byte, 1<<16)
+		t.Logf("stacks:\n%s", buf[:runtime.Stack(buf, true)])
+	}
+	if grew := openFiles(t) - fds; grew > 4 {
+		t.Errorf("open descriptors grew by %d (from %d)", grew, fds)
+	}
+	if after := heapAfterGC(); after > before+(4<<20) {
+		t.Errorf("heap grew by %d bytes (from %d to %d)", after-before, before, after)
+	}
 }
