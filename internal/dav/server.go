@@ -16,8 +16,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/webdav"
-
 	"github.com/q741451/115dav/internal/pan115"
 )
 
@@ -53,11 +51,10 @@ type Options struct {
 
 // Server serves a 115 account over read-only WebDAV.
 type Server struct {
-	tree     *Tree
-	stream   *streamer
-	propfind *webdav.Handler
-	opts     Options
-	log      *slog.Logger
+	tree   *Tree
+	stream *streamer
+	opts   Options
+	log    *slog.Logger
 }
 
 // New builds the server. It performs no I/O.
@@ -66,24 +63,11 @@ func New(opts Options) *Server {
 	if log == nil {
 		log = slog.Default()
 	}
-	tree := NewTree(opts.Backend, opts.RootID, opts.DirTTL)
-
 	return &Server{
-		tree:   tree,
+		tree:   NewTree(opts.Backend, opts.RootID, opts.DirTTL),
 		stream: newStreamer(opts.Backend, opts.LinkTTL, opts.RetryAfter, log),
-		propfind: &webdav.Handler{
-			FileSystem: &fileSystem{tree: tree},
-			// Required by the handler even though locking is never exercised:
-			// LOCK is rejected before it gets this far.
-			LockSystem: webdav.NewMemLS(),
-			Logger: func(r *http.Request, err error) {
-				if err != nil && !errors.Is(err, fs.ErrNotExist) {
-					log.Warn("propfind failed", "path", r.URL.Path, "err", err)
-				}
-			},
-		},
-		opts: opts,
-		log:  log,
+		opts:   opts,
+		log:    log,
 	}
 }
 
@@ -135,21 +119,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// servePropfind answers a listing, resolving everything the walk will read
-// before letting the WebDAV handler start writing.
+// servePropfind answers a listing.
 //
-// Doing it in this order is what makes an error reportable. x/net/webdav
-// discovers a listing failure halfway through the multi-status body, by which
-// point the 207 status line has gone out; worse, a failure wrapped as a
-// PathError -- which is every failure this filesystem produces -- is taken to
-// mean "this directory is unreadable, skip it", and the client is told the
-// directory is empty. An expired login would look exactly like a library that
-// had been deleted. Both resolutions below land in the cache the walk then
-// reads, so this replaces the requests it would have made rather than adding
-// to them.
+// Everything the response will mention is resolved before a byte of it is
+// written; see the note at the top of propfind.go for why that ordering is the
+// whole design and not an optimisation.
 func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
 	depth := parseDepth(r.Header.Get("Depth"))
-	if depth == depthInfinite {
+	switch depth {
+	case depthInfinite:
 		// RFC 4918 allows refusing an unbounded walk, and here it has to be
 		// refused: it would list the entire account, one rate-limited request
 		// per directory, for as long as that takes. Clients are expected to
@@ -159,24 +137,38 @@ func (s *Server) servePropfind(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)
 		io.WriteString(w, xml.Header+`<D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`)
 		return
+	case depthInvalid:
+		// A client's mistake rather than ours, so it is not a warning -- but
+		// worth having when a player is behaving oddly.
+		s.log.Debug("refused a PROPFIND with an unusable Depth",
+			"path", r.URL.Path, "depth", r.Header.Get("Depth"), "agent", r.UserAgent())
+		http.Error(w, "invalid depth", http.StatusBadRequest)
+		return
 	}
 
-	// A malformed Depth is left to the handler, which rejects it with 400
-	// before writing anything.
-	if depth != depthInvalid {
-		entry, err := s.tree.Lookup(r.Context(), r.URL.Path)
-		if err != nil {
-			s.replyLookupError(w, r, err)
-			return
-		}
-		if depth == 1 && entry.IsDir {
-			if _, err := s.tree.Children(r.Context(), entry.ID); err != nil {
-				s.replyLookupError(w, r, err)
-				return
-			}
-		}
+	req, err := parsePropfind(r.Body)
+	if err != nil {
+		s.log.Warn("could not read the PROPFIND body", "path", r.URL.Path, "err", err)
+		http.Error(w, "invalid PROPFIND body", http.StatusBadRequest)
+		return
 	}
-	s.propfind.ServeHTTP(w, r)
+
+	snap, err := s.snapshot(r.Context(), r.URL.Path, depth)
+	if err != nil {
+		s.replyLookupError(w, r, err)
+		return
+	}
+
+	// text/xml rather than application/xml, which is what this mount has always
+	// answered with and what some older clients look for. RFC 4918 permits
+	// either; the error responses above still use application/xml, an
+	// inconsistency inherited rather than introduced here.
+	w.Header().Set("Content-Type", "text/xml; charset=utf-8")
+	w.WriteHeader(http.StatusMultiStatus)
+	if err := writeMultistatus(w, snap, req); err != nil {
+		// Only the client going away can get here; the body was already built.
+		s.log.Debug("propfind write failed", "path", r.URL.Path, "err", err)
+	}
 }
 
 // Depth values, matching what x/net/webdav accepts. A missing header means
