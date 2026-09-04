@@ -3,7 +3,9 @@ package dav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
+	"net/http"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -200,5 +202,57 @@ func TestForgetDropsCache(t *testing.T) {
 	}
 	if got := backend.calls.Load(); got != 2 {
 		t.Errorf("list calls = %d, want 2", got)
+	}
+}
+
+// resolveAny hands out a link for any pick code, so the cache can be filled.
+type resolveAny struct{ calls atomic.Int64 }
+
+func (r *resolveAny) List(context.Context, string) ([]pan115.Entry, error) {
+	return nil, pan115.ErrNotFound
+}
+
+func (r *resolveAny) Resolve(_ context.Context, pickCode string) (*pan115.Target, error) {
+	r.calls.Add(1)
+	return &pan115.Target{URL: "http://example.invalid/" + pickCode, Header: http.Header{}}, nil
+}
+
+// An expired link must leave the map, not merely stop being served. Nothing
+// else removes one: forget() only runs when the CDN starts refusing a link, so
+// without this a library walked once would be retained for the life of the
+// process.
+func TestExpiredLinkIsEvicted(t *testing.T) {
+	cache := newLinkCache(&resolveAny{}, time.Nanosecond)
+
+	if _, err := cache.get(context.Background(), "pc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(cache.items); got != 1 {
+		t.Fatalf("cached %d links, want 1", got)
+	}
+
+	time.Sleep(time.Millisecond)
+	if target := cache.lookup("pc-1"); target != nil {
+		t.Error("an expired link was served")
+	}
+	if got := len(cache.items); got != 0 {
+		t.Errorf("%d expired links left behind, want 0", got)
+	}
+}
+
+func TestLinkCacheStaysBounded(t *testing.T) {
+	backend := &resolveAny{}
+	cache := newLinkCache(backend, time.Hour) // nothing expires on its own
+
+	for i := range maxCachedLinks + 500 {
+		if _, err := cache.get(context.Background(), fmt.Sprintf("pc-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := len(cache.items); got > maxCachedLinks {
+		t.Errorf("cached %d links, want at most %d", got, maxCachedLinks)
+	}
+	if got := backend.calls.Load(); got != int64(maxCachedLinks+500) {
+		t.Errorf("resolved %d times, want %d", got, maxCachedLinks+500)
 	}
 }

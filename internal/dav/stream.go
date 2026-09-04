@@ -35,6 +35,12 @@ type cachedLink struct {
 	expires time.Time
 }
 
+// maxCachedLinks bounds memory on a server that stays up for weeks. Each
+// entry holds a CDN URL and the headers to replay with it, on the order of a
+// kilobyte, and a library gets walked once and then never asked for again --
+// so without a ceiling the map only ever grows.
+const maxCachedLinks = 2048
+
 func newLinkCache(backend Backend, ttl time.Duration) *linkCache {
 	return &linkCache{backend: backend, ttl: ttl, items: map[string]cachedLink{}}
 }
@@ -53,9 +59,7 @@ func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, e
 		if err != nil {
 			return nil, err
 		}
-		c.mu.Lock()
-		c.items[pickCode] = cachedLink{target: target, expires: time.Now().Add(c.ttl)}
-		c.mu.Unlock()
+		c.store(pickCode, target)
 		return target, nil
 	})
 	if err != nil {
@@ -67,10 +71,41 @@ func (c *linkCache) get(ctx context.Context, pickCode string) (*pan115.Target, e
 func (c *linkCache) lookup(pickCode string) *pan115.Target {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if item, ok := c.items[pickCode]; ok && time.Now().Before(item.expires) {
-		return item.target
+	item, ok := c.items[pickCode]
+	if !ok {
+		return nil
 	}
-	return nil
+	if !time.Now().Before(item.expires) {
+		// Drop it here rather than leaving it to pile up. Nothing else will:
+		// forget() only runs when the CDN starts refusing a link.
+		delete(c.items, pickCode)
+		return nil
+	}
+	return item.target
+}
+
+func (c *linkCache) store(pickCode string, target *pan115.Target) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.items) >= maxCachedLinks {
+		c.sweepLocked()
+	}
+	c.items[pickCode] = cachedLink{target: target, expires: time.Now().Add(c.ttl)}
+}
+
+// sweepLocked drops expired links, and everything if that was not enough. A
+// cold cache costs one resolve per file, which is cheaper than an unbounded
+// map on a device with little memory to spare.
+func (c *linkCache) sweepLocked() {
+	now := time.Now()
+	for code, item := range c.items {
+		if !now.Before(item.expires) {
+			delete(c.items, code)
+		}
+	}
+	if len(c.items) >= maxCachedLinks {
+		clear(c.items)
+	}
 }
 
 func (c *linkCache) forget(pickCode string) {
