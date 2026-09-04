@@ -43,27 +43,44 @@ func TestOneFileHasOneIdentity(t *testing.T) {
 	}
 }
 
-// Length is the one field the listing and the CDN both state, so it is where a
-// stale listing can be caught. Serving the transfer anyway would put the new
-// file's bytes behind the old file's ETag, modification time and the length a
-// HEAD has already promised -- and nothing downstream could notice.
-func TestAReplacedFileIsRefusedRatherThanMislabelled(t *testing.T) {
-	for name, corrupt := range map[string]func(*fakeBackend){
-		"the download endpoint reports another size": func(b *fakeBackend) {
-			b.blobs["pc-film"] = []byte("a much shorter file than the listing claims")
-		},
-	} {
-		t.Run(name, func(t *testing.T) {
-			b := sample(t)
-			corrupt(b)
-			srv := newTestServer(t, b, Options{})
+// 115 lists some old files at a size that is simply wrong -- one byte for a
+// four hundred megabyte video, its download endpoint agreeing with the listing
+// and only the transfer knowing better. Refusing on the disagreement made
+// every such file unplayable, so the CDN's bytes win and the file plays.
+func TestAFileListedAtTheWrongSizeStillPlays(t *testing.T) {
+	b := sample(t)
+	// The listing keeps the size it was built with; the file behind it is a
+	// different length, as 115's malformed entries are.
+	b.blobs["pc-film"] = []byte(strings.Repeat("x", 40000))
+	srv := newTestServer(t, b, Options{})
 
-			resp := do(t, srv, http.MethodGet, "/film.mkv", nil)
-			if resp.StatusCode != http.StatusBadGateway {
-				t.Errorf("status = %d, want %d -- a size the listing disagrees with was served",
-					resp.StatusCode, http.StatusBadGateway)
-			}
-		})
+	resp := do(t, srv, http.MethodGet, "/film.mkv", nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200 -- a wrong listed size must not make a file unplayable", resp.StatusCode)
+	}
+	// And what arrives is the whole file, described by the CDN's length rather
+	// than the listing's.
+	got := body(t, resp)
+	if len(got) != len(b.blobs["pc-film"]) {
+		t.Errorf("served %d bytes of %d", len(got), len(b.blobs["pc-film"]))
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(got)) {
+		t.Errorf("Content-Length = %q for a %d byte body", cl, len(got))
+	}
+}
+
+// A range of such a file works too, which is what a player actually asks for.
+func TestARangeOfAFileListedAtTheWrongSizeWorks(t *testing.T) {
+	b := sample(t)
+	b.blobs["pc-film"] = []byte(strings.Repeat("y", 40000))
+	srv := newTestServer(t, b, Options{})
+
+	resp := do(t, srv, http.MethodGet, "/film.mkv", map[string]string{"Range": "bytes=100-199"})
+	if resp.StatusCode != http.StatusPartialContent {
+		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	}
+	if n := len(body(t, resp)); n != 100 {
+		t.Errorf("got %d bytes, want 100", n)
 	}
 }
 

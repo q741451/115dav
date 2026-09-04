@@ -265,11 +265,9 @@ func entryTag(entry pan115.Entry) string {
 func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, mine *slot, entry pan115.Entry, id identity, resp *http.Response) error {
 	defer resp.Body.Close()
 
-	// The last point at which a disagreement can still be reported: nothing has
-	// been written yet, so this can be a status code rather than a truncated
-	// file the client would take for the real one.
-	if err := id.checkLength(resp, entry.Name); err != nil {
-		return err
+	if size, differs := id.actualSize(resp); differs {
+		s.log.Debug("115 lists this file at the wrong size; serving what the CDN sends",
+			"file", entry.Name, "listed", id.size, "actual", size)
 	}
 
 	copyResponseHeaders(w.Header(), resp.Header, id)
@@ -336,16 +334,6 @@ func (s *streamer) open(ctx context.Context, r *http.Request, e *epoch, entry pa
 		if err != nil {
 			return nil, err
 		}
-		// The resolve reports the file's size too, and it was paid for
-		// already. Checking it here catches a stale listing one round trip
-		// before the CDN would, and without opening a connection.
-		if target.Size > 0 && target.Size != id.size {
-			return nil, &errStaleEntry{
-				file: entry.Name, wanted: id.size, actual: target.Size,
-				source: "the 115 download endpoint",
-			}
-		}
-
 		resp, err := s.fetch(ctx, r, entry, target)
 		throttled, expired := false, false
 		if err == nil {
@@ -556,49 +544,35 @@ func copyResponseHeaders(dst, src http.Header, id identity) {
 	}
 }
 
-// errStaleEntry reports that the file the CDN is about to send is not the one
-// the listing described.
-type errStaleEntry struct {
-	file           string
-	wanted, actual int64
-	source         string
-}
-
-func (e *errStaleEntry) Error() string {
-	return fmt.Sprintf("%s says %s is %d bytes, but the listing this request was answered from says %d;"+
-		" the cached directory is stale", e.source, e.file, e.actual, e.wanted)
-}
-
-// checkLength refuses a transfer whose size contradicts the identity already
-// promised for this file.
+// actualSize reports the length the CDN is about to send when it differs from
+// the listing's.
 //
-// Length is the one field that both sides state, so it is the one place the
-// two sources of truth can be caught disagreeing. They disagree when a file
-// has been replaced under the same name since the directory was listed, and
-// serving it anyway would send the new file's bytes under the old file's ETag,
-// modification time and -- for a HEAD already answered -- length. Refusing
-// costs this one request; the listing expires and the next one is right.
-func (id identity) checkLength(resp *http.Response, file string) error {
+// 115 lists some old files at the wrong size -- one byte for a four hundred
+// megabyte video, with its download endpoint repeating the same number. Only
+// the transfer knows, so a disagreement is not a reason to refuse: the
+// response already carries the CDN's own Content-Length and Content-Range, and
+// this is here so that -v explains why PROPFIND said something else.
+func (id identity) actualSize(resp *http.Response) (int64, bool) {
 	switch resp.StatusCode {
 	case http.StatusPartialContent:
-		// "bytes 100-199/21981": only the total is ours to check. A "*" total
-		// is legal and says the CDN does not know it, which is not a conflict.
+		// "bytes 100-199/21981": only the total says anything about the file.
+		// A "*" total is legal and means the CDN does not know it either.
 		_, total, ok := strings.Cut(resp.Header.Get("Content-Range"), "/")
 		if !ok || total == "*" {
-			return nil
+			return 0, false
 		}
 		size, err := strconv.ParseInt(strings.TrimSpace(total), 10, 64)
 		if err != nil || size == id.size {
-			return nil
+			return 0, false
 		}
-		return &errStaleEntry{file: file, wanted: id.size, actual: size, source: "the CDN's Content-Range"}
+		return size, true
 	case http.StatusOK:
 		if resp.ContentLength < 0 || resp.ContentLength == id.size {
-			return nil
+			return 0, false
 		}
-		return &errStaleEntry{file: file, wanted: id.size, actual: resp.ContentLength, source: "the CDN's Content-Length"}
+		return resp.ContentLength, true
 	}
-	return nil
+	return 0, false
 }
 
 const defaultContentType = "application/octet-stream"
