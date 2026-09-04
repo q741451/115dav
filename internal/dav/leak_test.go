@@ -53,6 +53,10 @@ func TestCancelledRequestDoesNotPoisonSharedWork(t *testing.T) {
 				<-release
 			})
 			srv := newTestServer(t, b, Options{})
+			// This test is about several requests sharing one piece of work,
+			// so the file limit -- which would cut all but the newest two of
+			// them -- has to be out of the way. slots is covered separately.
+			unlimitStreams(t, srv)
 			path := "/"
 			if tc.method == http.MethodGet {
 				path = "/film.mkv"

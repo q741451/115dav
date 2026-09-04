@@ -206,23 +206,42 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 	// would almost never fire. And nothing has been written to the client at
 	// this point, so replacing the credentials and starting again is still
 	// possible. Past here it is not.
+	// A slot in the file, taken before the request that needs it and given back
+	// when the bytes stop. Its context, not the request's, is what the upstream
+	// call runs on, so that a later reader of the same file can end this one;
+	// see slots.
+	//
+	// It is declared out here because withEpoch may run the body twice, and the
+	// slot from a first attempt has to be given back before the second asks for
+	// one -- otherwise the two count against the file together and the retry is
+	// refused for being the third of two.
+	var release func()
+	defer func() {
+		if release != nil {
+			release()
+		}
+	}()
+
 	got, err := withEpoch(s.epochs, r.Context(), func(e *epoch) (content, error) {
+		if release != nil {
+			release()
+			release = nil
+		}
 		entry, err := e.tree.Lookup(r.Context(), r.URL.Path)
 		if err != nil || entry.IsDir || r.Method == http.MethodHead {
 			return content{epoch: e, entry: entry}, err
 		}
+
 		id := identityOf(entry)
-		resp, err := s.stream.open(r, e, entry, id)
-		return content{epoch: e, entry: entry, id: id, resp: resp}, err
+		ctx, mine, give := s.stream.slots.acquire(r.Context(), entry.PickCode, entry.Name)
+		release = give
+		resp, err := s.stream.open(ctx, r, e, entry, id)
+		if err != nil {
+			return content{epoch: e, entry: entry}, err
+		}
+		return content{epoch: e, entry: entry, id: id, resp: resp, slot: mine}, nil
 	})
 	if err != nil {
-		// open returns no response alongside an error, so this closes nothing
-		// today. It is here because the alternative to stating the invariant is
-		// depending on it silently: a later change that returns both would leak
-		// a connection per failed request, and nothing would say so.
-		if got.resp != nil {
-			got.resp.Body.Close()
-		}
 		s.replyError(w, r, got.entry, err)
 		return
 	}
@@ -233,7 +252,7 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodHead:
 		s.stream.serveHead(w, got.entry)
 	default:
-		if err := s.stream.pipe(w, r, got.entry, got.id, got.resp); err != nil {
+		if err := s.stream.pipe(w, r, got.slot, got.entry, got.id, got.resp); err != nil {
 			s.replyError(w, r, got.entry, err)
 		}
 	}
@@ -243,6 +262,7 @@ func (s *Server) serveContent(w http.ResponseWriter, r *http.Request) {
 // credentials.
 type content struct {
 	epoch *epoch
+	slot  *slot
 	entry pan115.Entry
 	id    identity
 	resp  *http.Response // nil for HEAD and for directories
@@ -277,8 +297,20 @@ func (s *Server) replyError(w http.ResponseWriter, r *http.Request, entry pan115
 		return
 	}
 
-	var notDownloadable *pan115.ErrNotDownloadable
+	var (
+		notDownloadable *pan115.ErrNotDownloadable
+		upstream        *upstreamError
+	)
 	switch {
+	case errors.As(err, &upstream) && upstream.temporary():
+		// This moment rather than this file: either 115 is already serving it
+		// as many times at once as it allows, or this read was cut here to
+		// admit a newer one. Both pass in seconds, so a short Retry-After is
+		// worth more to a player than the 502 that covers everything else --
+		// which invites it to give up on a file that is perfectly fine.
+		s.log.Info("refusing a read of a file that is busy", "path", r.URL.Path, "err", err)
+		w.Header().Set("Retry-After", "1")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, errNoCredentials), errors.Is(err, ErrUnavailable):
 		s.serveUnavailable(w)
 	case errors.Is(err, fs.ErrNotExist), errors.Is(err, pan115.ErrNotFound):

@@ -159,6 +159,7 @@ func (c *linkCache) forget(pickCode string, failed *pan115.Target) {
 // from the Target that was resolved for it.
 type streamer struct {
 	client *http.Client
+	slots  *slots
 	log    *slog.Logger
 	bufs   sync.Pool
 }
@@ -190,8 +191,9 @@ func newStreamer(log *slog.Logger) *streamer {
 				ForceAttemptHTTP2:   true,
 			},
 		},
-		log:  log,
-		bufs: sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
+		slots: newSlots(log),
+		log:   log,
+		bufs:  sync.Pool{New: func() any { b := make([]byte, streamBufferSize); return &b }},
 	}
 }
 
@@ -260,7 +262,7 @@ func entryTag(entry pan115.Entry) string {
 //
 // Opening is done by the caller, inside the retry that can still replace the
 // credentials; by the time anything gets here the response is committed.
-func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, entry pan115.Entry, id identity, resp *http.Response) error {
+func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, mine *slot, entry pan115.Entry, id identity, resp *http.Response) error {
 	defer resp.Body.Close()
 
 	// The last point at which a disagreement can still be reported: nothing has
@@ -282,6 +284,14 @@ func (s *streamer) pipe(w http.ResponseWriter, r *http.Request, entry pan115.Ent
 	client := &clientWriter{Writer: w}
 	switch _, err := io.CopyBuffer(client, resp.Body, *buf); {
 	case err == nil:
+	case s.slots.evicted(mine):
+		// Someone asked for this file while it was already being served the
+		// most times 115 will allow, and this was the older stream. The player
+		// sees a truncated response and will usually reconnect, which is the
+		// accepted cost of never having to guess whether a quiet stream is
+		// still wanted.
+		s.log.Info("stream cut short to admit a newer request for the same file",
+			"file", entry.Name, "limit", s.slots.limit)
 	case client.err != nil, r.Context().Err() != nil:
 		// Players close connections constantly: after probing a container,
 		// on every seek, and when playback stops. Which half of the copy
@@ -313,10 +323,16 @@ func (c *clientWriter) Write(p []byte) (int, error) {
 
 // open resolves the file and performs the upstream request, retrying once if
 // the CDN rejects the cached URL or the connection fails outright.
-func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identity) (*http.Response, error) {
-	var lastErr error
-	for attempt := range 2 {
-		target, err := e.links.get(r.Context(), entry.PickCode)
+func (s *streamer) open(ctx context.Context, r *http.Request, e *epoch, entry pan115.Entry, id identity) (*http.Response, error) {
+	var (
+		lastErr   error
+		throttles int
+	)
+	// Being throttled does not spend an attempt: the two failures are
+	// unrelated, and a link that has to be resolved again after a wait would
+	// otherwise have no attempt left to use it.
+	for attempt := 0; attempt < 2; {
+		target, err := e.links.get(ctx, entry.PickCode)
 		if err != nil {
 			return nil, err
 		}
@@ -330,7 +346,11 @@ func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identi
 			}
 		}
 
-		resp, err := s.fetch(r, entry, target)
+		resp, err := s.fetch(ctx, r, entry, target)
+		throttled, expired := false, false
+		if err == nil {
+			throttled, expired = classify(resp)
+		}
 		switch {
 		case err != nil:
 			// The connection failed before any answer arrived. Nothing has
@@ -338,7 +358,14 @@ func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identi
 			// trying again costs a round trip and saves a failed playback --
 			// a home uplink drops connections for a living. The cached URL is
 			// kept: it is the connection that failed, not the link.
-			if r.Context().Err() != nil {
+			if ctx.Err() != nil {
+				if r.Context().Err() == nil {
+					// Not the client leaving: this read was cut to admit a
+					// newer one of the same file. Saying "bad gateway" would
+					// blame 115 for a decision made here, and tell the player
+					// to give up on something it should retry.
+					return nil, &upstreamError{file: entry.Name, evicted: true}
+				}
 				return nil, err
 			}
 			lastErr = err
@@ -346,7 +373,23 @@ func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identi
 				s.log.Debug("upstream connection failed, trying once more",
 					"file", entry.Name, "err", err)
 			}
-		case !isExpired(resp.StatusCode):
+		case throttled:
+			// The link is good and is kept. Only the timing was wrong.
+			io.CopyN(io.Discard, resp.Body, maxDiscardedBody)
+			resp.Body.Close()
+			lastErr = &upstreamError{status: resp.StatusCode, file: entry.Name, throttled: true}
+			if throttles++; throttles > maxThrottleRetries {
+				return nil, lastErr
+			}
+			s.log.Debug("115 is already serving this file as often as it allows, waiting",
+				"file", entry.Name, "attempt", throttles)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(throttleBackoff):
+			}
+			continue
+		case !expired:
 			return resp, nil
 		default:
 			// Drained, not just closed. HTTP/1.1 cannot reuse a connection
@@ -364,6 +407,7 @@ func (s *streamer) open(r *http.Request, e *epoch, entry pan115.Entry, id identi
 					"file", entry.Name, "status", resp.StatusCode)
 			}
 		}
+		attempt++
 	}
 	return nil, lastErr
 }
@@ -384,8 +428,8 @@ func rangeStillApplies(r *http.Request, entry pan115.Entry) bool {
 	return err == nil && !entry.ModTime.IsZero() && stamp.Equal(entry.ModTime.UTC().Truncate(time.Second))
 }
 
-func (s *streamer) fetch(r *http.Request, entry pan115.Entry, target *pan115.Target) (*http.Response, error) {
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target.URL, nil)
+func (s *streamer) fetch(ctx context.Context, r *http.Request, entry pan115.Entry, target *pan115.Target) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.URL, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -406,21 +450,72 @@ func (s *streamer) fetch(r *http.Request, entry pan115.Entry, target *pan115.Tar
 type upstreamError struct {
 	status int
 	file   string
+	// throttled: 115 refused because the file is already being served as many
+	// times at once as it allows. evicted: this read was cut here, to admit a
+	// newer one of the same file. Both are this moment rather than this file,
+	// so both are answered 503 and both are worth retrying.
+	throttled bool
+	evicted   bool
 }
 
 func (e *upstreamError) Error() string {
+	switch {
+	case e.evicted:
+		return "the read of " + e.file + " was cut short to admit a newer one of the same file"
+	case e.throttled:
+		return "115 is already serving " + e.file + " as many times at once as it allows"
+	}
 	return "115 cdn refused the download link for " + e.file + ": HTTP " + strconv.Itoa(e.status)
 }
 
-// isExpired reports whether a CDN status means "this URL is no longer good"
-// rather than "this request was wrong".
-func isExpired(status int) bool {
-	switch status {
-	case http.StatusUnauthorized, http.StatusForbidden, http.StatusGone:
-		return true
+// temporary reports whether asking again shortly is worth the client's while.
+func (e *upstreamError) temporary() bool { return e.throttled || e.evicted }
+
+// A 403 from the CDN means one of two opposite things, and the body is what
+// tells them apart.
+//
+//	{"status":403,"message":"115 pmt 3-2","request_id":"..."}
+//
+// A "pmt" refusal is the file being served as many times at once as 115 will
+// allow. The URL is fine; asking again in a moment works. Throwing it away
+// would spend one of two calls a second on the download endpoint to be handed
+// back the same URL -- and if that happened on every seek, most of the rate
+// limit would go on re-fetching links that were never stale.
+//
+// Any other 403, and 401 and 410, mean the URL itself is finished, and the
+// only way forward is to resolve again.
+const throttleMarker = "pmt"
+
+func classify(resp *http.Response) (throttled, expired bool) {
+	switch resp.StatusCode {
+	case http.StatusUnauthorized, http.StatusGone:
+		return false, true
+	case http.StatusForbidden:
+		// The refusal is a short JSON body; read enough to recognise it and
+		// drain the rest so the connection can be reused.
+		prefix, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if strings.Contains(string(prefix), throttleMarker) {
+			return true, false
+		}
+		return false, true
 	}
-	return false
+	return false, false
 }
+
+// throttleBackoff is how long to wait before asking again after a "pmt"
+// refusal.
+//
+// It exists because evicting a stream is not instant end to end: cancelling
+// aborts our request immediately, but 115 stops counting it only once the
+// connection teardown reaches it, and how long that takes is not something
+// this side can see. Rather than guess at a delay before every request, the
+// refusal itself is the signal -- which also covers the slots this process
+// cannot know about, such as the same file being played on another device.
+var throttleBackoff = 400 * time.Millisecond
+
+// maxThrottleRetries bounds the wait. Past it the file really is busy, and
+// saying so beats holding a player open indefinitely.
+const maxThrottleRetries = 3
 
 // passthroughHeaders are copied from the CDN response as-is: they describe
 // this transfer, which only the CDN knows about. Everything that describes the

@@ -33,6 +33,7 @@ type fakeBackend struct {
 	generation atomic.Int64
 
 	listErr       atomic.Pointer[error]
+	throttleFirst atomic.Int64 // refuse this many fetches with "115 pmt"
 	resolveErr    atomic.Pointer[error]
 	dropOnce      atomic.Bool
 	beforeList    func()
@@ -72,6 +73,16 @@ func newFakeBackend(t *testing.T) *fakeBackend {
 		}
 		if got := r.Header.Get("Cookie"); !strings.Contains(got, "UID=u") {
 			b.t.Errorf("origin saw Cookie %q, want the 115 session", got)
+		}
+
+		// The refusal 115 gives when a file is already being served as many
+		// times at once as it allows. The link is fine; the timing is not.
+		if b.throttleFirst.Load() > 0 {
+			b.throttleFirst.Add(-1)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"status":403,"message":"115 pmt 3-2","request_id":"abc"}`)
+			return
 		}
 
 		if r.URL.Query().Get("g") != fmt.Sprint(b.generation.Load()) {
@@ -182,6 +193,14 @@ func newTestServer(t *testing.T, b *fakeBackend, opts Options) *httptest.Server 
 	srv := httptest.NewServer(New(context.Background(), opts))
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// unlimitStreams takes the per-file stream limit out of a test's way, for the
+// tests that are about something else and would otherwise be evicting their
+// own requests.
+func unlimitStreams(t *testing.T, srv *httptest.Server) {
+	t.Helper()
+	srv.Config.Handler.(*Server).stream.slots.limit = 1 << 20
 }
 
 func do(t *testing.T, srv *httptest.Server, method, path string, headers map[string]string) *http.Response {
